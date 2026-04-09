@@ -62,6 +62,14 @@ def build_state() -> GameState:
                 universe_type="AU",
                 tone_and_style="ominous and tense",
             ),
+            world_book={
+                "campaign_context": {
+                    "era_and_timeline": "咒术高专冬季封锁周，第4天夜里",
+                    "macro_world_state": "废弃城区已经被诅咒污染，高专派出的清剿小队在黑夜里逐片推进。",
+                    "looming_crisis": "污染核心正在苏醒，如果不能尽快摸清遗迹内部结构，整片街区都会失控。",
+                    "opening_scene": "你踩着碎玻璃进入坍塌走廊，远处墙缝渗出黑色咒雾，脚边忽然滚来一枚带血的校徽。",
+                }
+            },
             glossary=WorldGlossary(
                 stats={"stat_hp": "生命值"},
                 damage_types={"dmg_kinetic": "冲击"},

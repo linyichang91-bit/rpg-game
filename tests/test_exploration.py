@@ -68,6 +68,14 @@ def build_state() -> GameState:
                 universe_type="Dark AU",
                 tone_and_style="压抑、诡秘、危险",
             ),
+            world_book={
+                "campaign_context": {
+                    "era_and_timeline": "木叶60年，边境封锁的第三夜",
+                    "macro_world_state": "木叶前线正在秘密收缩兵力，边境巡逻队人人自危，谁也不敢轻信陌生忍者。",
+                    "looming_crisis": "天亮前若找不到新的安全据点，追踪而来的敌忍就会包围营地。",
+                    "opening_scene": "你在营火将熄的野营地边猛地睁眼，林间有苦无擦过树皮，黑暗里传来短促的脚步声。",
+                }
+            },
             glossary=WorldGlossary(
                 stats={"stat_hp": "生命值"},
                 damage_types={"dmg_kinetic": "物理冲击"},

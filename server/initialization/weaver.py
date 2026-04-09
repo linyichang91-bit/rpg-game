@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from textwrap import dedent
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args, get_origin
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from server.llm.config import LLMSettings
 from server.llm.json_payload import normalize_json_payload
@@ -79,7 +79,7 @@ class WorldWeaver:
                 last_error = exc
 
         raise WorldConfigValidationError(
-            "世界织布机未能生成合法的世界配置数据。"
+            _build_world_config_validation_error_message(last_error)
         ) from last_error
 
 
@@ -117,7 +117,16 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         3. Set fanfic_meta.tone_and_style to the user's requested mood and style.
         4. Build a world glossary that maps engine abstract keys into setting-specific terms.
         5. Preload a fitting starting_location, 1-3 key_npcs, and opening initial_quests.
-        6. Produce engine-facing JSON only. Do not write story prose, dialogue, or an opening scene.
+        6. Populate world_book.campaign_context with timeline-locked lore anchors.
+        7. Produce engine-facing JSON only. Do not write explanatory text outside the JSON object.
+
+        Lore generation rules for world_book.campaign_context:
+        - You must anchor the setting to the exact requested era and timeline.
+        - era_and_timeline must name a precise canon era, arc, year, or timeline node.
+        - macro_world_state must reflect only factions, institutions, and NPCs who should exist at that time.
+        - Never introduce future characters early, never revive dead characters, and never collapse distant eras together.
+        - opening_scene must be vivid and immediate: include a concrete physical location, active motion, sensory detail,
+          and one urgent hook that forces the player to react.
 
         Glossary minimums:
         - stats should include at least stat_hp and stat_mp when the setting has a spiritual, magical, psychic, or energy resource.
@@ -128,6 +137,7 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - You must strictly follow the JSON schema.
         - Do not output any explanatory text outside the JSON object.
         - Keep mechanics abstract and engine-friendly.
+        - world_book.campaign_context must obey canon timeline logic as strictly as possible.
         - All player-visible strings should be written in Simplified Chinese whenever possible.
         """
     ).strip()
@@ -143,6 +153,10 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - fanfic_meta.base_ip
         - fanfic_meta.universe_type
         - fanfic_meta.tone_and_style
+        - world_book.campaign_context.era_and_timeline
+        - world_book.campaign_context.macro_world_state
+        - world_book.campaign_context.looming_crisis
+        - world_book.campaign_context.opening_scene
         - glossary.stats
         - glossary.damage_types
         - glossary.item_categories
@@ -157,8 +171,8 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - item_categories: item_weapon
 
         Language requirements:
-        - theme, fanfic_meta.universe_type, fanfic_meta.tone_and_style, glossary values,
-          starting_location, key_npcs, and initial_quests should use Simplified Chinese.
+        - theme, fanfic_meta.universe_type, fanfic_meta.tone_and_style, world_book.campaign_context,
+          glossary values, starting_location, key_npcs, and initial_quests should use Simplified Chinese.
         - Prefer established Chinese translations for well-known IP names when appropriate.
         """
     ).strip()
@@ -175,6 +189,15 @@ def _normalize_world_config_payload(payload: Any) -> Any:
         return payload
 
     normalized = dict(payload)
+    top_level_campaign_context = normalized.pop("campaign_context", None)
+    if "world_book" not in normalized and isinstance(top_level_campaign_context, dict):
+        normalized["world_book"] = {"campaign_context": top_level_campaign_context}
+    elif isinstance(normalized.get("world_book"), dict):
+        world_book = dict(normalized["world_book"])
+        if "campaign_context" not in world_book and isinstance(top_level_campaign_context, dict):
+            world_book["campaign_context"] = top_level_campaign_context
+        normalized["world_book"] = world_book
+
     normalized["starting_location"] = _coerce_string_value(
         normalized.get("starting_location"),
         preferred_keys=("location_name", "name", "location_id", "id"),
@@ -187,7 +210,73 @@ def _normalize_world_config_payload(payload: Any) -> Any:
         normalized.get("initial_quests"),
         preferred_keys=("quest_name", "name", "quest_id", "id", "objective"),
     )
+    return _prune_to_model_schema(normalized, WorldConfig)
+
+
+def _build_world_config_validation_error_message(error: Exception | None) -> str:
+    base_message = "世界织布机未能生成合法的世界配置数据。"
+    if error is None:
+        return base_message
+
+    if isinstance(error, ValidationError):
+        issue_summaries: list[str] = []
+        for issue in error.errors()[:3]:
+            path = ".".join(str(part) for part in issue.get("loc", ())) or "<root>"
+            message = issue.get("msg", "校验失败")
+            issue_summaries.append(f"{path}: {message}")
+        if issue_summaries:
+            return f"{base_message} 最后一次校验失败：{'；'.join(issue_summaries)}"
+
+    if isinstance(error, json.JSONDecodeError):
+        return f"{base_message} 最后一次返回不是合法 JSON：{error.msg}"
+
+    return f"{base_message} {error}"
+
+
+def _prune_to_model_schema(payload: Any, model_type: type[BaseModel]) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized: dict[str, Any] = {}
+    for field_name, field_info in model_type.model_fields.items():
+        if field_name not in payload:
+            continue
+        normalized[field_name] = _prune_value_to_annotation(
+            payload[field_name],
+            field_info.annotation,
+        )
     return normalized
+
+
+def _prune_value_to_annotation(value: Any, annotation: Any) -> Any:
+    origin = get_origin(annotation)
+    if origin is None:
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return _prune_to_model_schema(value, annotation)
+        return value
+
+    if origin in (list, tuple):
+        if not isinstance(value, list):
+            return value
+        item_type = get_args(annotation)[0] if get_args(annotation) else Any
+        return [_prune_value_to_annotation(item, item_type) for item in value]
+
+    if origin is dict:
+        if not isinstance(value, dict):
+            return value
+        args = get_args(annotation)
+        value_type = args[1] if len(args) > 1 else Any
+        return {
+            key: _prune_value_to_annotation(item, value_type)
+            for key, item in value.items()
+        }
+
+    union_args = [arg for arg in get_args(annotation) if arg is not type(None)]
+    for union_arg in union_args:
+        if isinstance(union_arg, type) and issubclass(union_arg, BaseModel):
+            return _prune_to_model_schema(value, union_arg)
+
+    return value
 
 
 def _coerce_string_list(

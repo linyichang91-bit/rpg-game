@@ -7,13 +7,13 @@ from threading import RLock
 from uuid import uuid4
 
 from server.schemas.core import (
+    ContextEntity,
     GameState,
     PlayerState,
     RuntimeEntityState,
     WorldConfig,
     WorldNode,
 )
-from server.schemas.orchestrator import ContextEntity
 
 
 DEFAULT_WEAPON_KEY = "item_weapon_01"
@@ -41,6 +41,7 @@ class SessionRecord:
     game_state: GameState
     world_prompt: str | None
     location_summary: str
+    recent_visible_text: str | None = None
     nearby_npcs: list[ContextEntity] = field(default_factory=list)
     encounter_names: dict[str, str] = field(default_factory=dict)
     lootable_targets: dict[str, LootTarget] = field(default_factory=dict)
@@ -48,7 +49,7 @@ class SessionRecord:
     dynamic_location_counter: int = 0
 
     def build_nearby_entities(self) -> list[ContextEntity]:
-        """Combine static NPCs, live enemies, and lootable objects for the brain."""
+        """Combine static NPCs, live enemies, and lootable objects for the GM agent."""
 
         entities = list(self.nearby_npcs)
         for entity_id in self.game_state.encounter_entities:

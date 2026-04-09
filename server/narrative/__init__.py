@@ -1,1 +1,0 @@
-"""Narrative presentation layer."""

@@ -10,6 +10,17 @@ export interface FanficMetaData {
   tone_and_style: string;
 }
 
+export interface CampaignContext {
+  era_and_timeline: string;
+  macro_world_state: string;
+  looming_crisis: string;
+  opening_scene: string;
+}
+
+export interface WorldBook {
+  campaign_context: CampaignContext;
+}
+
 export interface WorldNode {
   node_id: string;
   title: string;
@@ -29,12 +40,24 @@ export interface WorldConfig {
   world_id: string;
   theme: string;
   fanfic_meta: FanficMetaData;
+  world_book: WorldBook;
   glossary: WorldGlossary;
   starting_location: string;
   key_npcs: string[];
   initial_quests: string[];
   mechanics: Record<string, unknown>;
   topology: WorldTopology;
+}
+
+export interface TimingStage {
+  stage_id: string;
+  label: string;
+  duration_ms: number;
+}
+
+export interface RequestTelemetry {
+  total_ms: number;
+  stages: TimingStage[];
 }
 
 export interface PlayerState {
@@ -93,6 +116,7 @@ export interface AuditPacket {
 
 export interface WorldGenerateResponse {
   world_config: WorldConfig;
+  telemetry?: RequestTelemetry | null;
 }
 
 export interface GameStartRequest {
@@ -106,6 +130,7 @@ export interface GameTurnResponse {
   narration: string;
   executed_events?: ExecutedEvent[];
   mutation_logs?: MutationLog[];
+  telemetry?: RequestTelemetry | null;
 }
 
 export interface GameActionRequest {

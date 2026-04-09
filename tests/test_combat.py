@@ -39,6 +39,14 @@ def build_state() -> GameState:
                 universe_type="Original",
                 tone_and_style="harsh and desperate",
             ),
+            world_book={
+                "campaign_context": {
+                    "era_and_timeline": "前线遗迹纪年，补给线断裂后的第七周",
+                    "macro_world_state": "残存据点正为了最后几条交通线互相提防，野外到处是失控的猎杀者。",
+                    "looming_crisis": "检查站守不住的话，整条撤离线都会被撕开缺口。",
+                    "opening_scene": "你蹲在半塌的检查站掩体后装弹，远处尘雾里忽然冲出一头带血的獠牙怪物。",
+                }
+            },
             glossary=WorldGlossary(
                 stats={"stat_hp": "Hull", "stat_stamina": "Drive"},
                 damage_types={"dmg_kinetic": "Impact"},

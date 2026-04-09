@@ -59,6 +59,49 @@ class FanficMetaData(EngineBaseModel):
     tone_and_style: StrictStr
 
 
+class CampaignContext(EngineBaseModel):
+    """Narrative anchor points that lock the campaign to a specific timeline and opening."""
+
+    era_and_timeline: StrictStr = Field(
+        ...,
+        description=(
+            "精确的时代与时间线节点。例如：'木叶60年，中忍考试前夕' "
+            "或 '掠夺者时代，1971年9月'"
+        ),
+    )
+    macro_world_state: StrictStr = Field(
+        ...,
+        description=(
+            "当前世界的宏观局势与常识。例如：'大蛇丸正暗中谋划崩溃木叶，各村表面和平但暗流涌动' "
+            "或 '伏地魔势力初现，魔法界人心惶惶'"
+        ),
+    )
+    looming_crisis: StrictStr = Field(
+        ...,
+        description=(
+            "悬在主角头顶的终极危机或主线阴影，用于制造紧迫感。"
+            "例如：'距离中忍考试死亡森林篇只剩3天，必须尽快提升实力'"
+        ),
+    )
+    opening_scene: StrictStr = Field(
+        ...,
+        description=(
+            "【第一章特化】开局的具体地点、感官细节与突发事件。"
+            "例如：'玩家在木叶忍者学校的阴暗走廊醒来，手里死死攥着一张不及格的忍术试卷，"
+            "窗外突然传来巨大的爆炸声。'"
+        ),
+    )
+
+
+class WorldBook(EngineBaseModel):
+    """Lore-book style narrative context attached to the generated world."""
+
+    campaign_context: CampaignContext = Field(
+        ...,
+        description="该同人宇宙的叙事大纲与时空背景。",
+    )
+
+
 class WorldNode(EngineBaseModel):
     """A single discoverable location in the runtime topology graph."""
 
@@ -117,6 +160,7 @@ class WorldConfig(EngineBaseModel):
     world_id: StrictStr
     theme: StrictStr
     fanfic_meta: FanficMetaData
+    world_book: WorldBook
     glossary: WorldGlossary
     starting_location: StrictStr
     key_npcs: list[StrictStr] = Field(default_factory=list)
@@ -150,6 +194,15 @@ class RuntimeEntityState(EngineBaseModel):
     @classmethod
     def validate_entity_keys(cls, value: dict[str, Any], info: Any) -> dict[str, Any]:
         return _validate_abstract_mapping_keys(value, info.field_name)
+
+
+class ContextEntity(EngineBaseModel):
+    """Nearby entity details exposed to the GM agent for target resolution."""
+
+    entity_id: StrictStr
+    display_name: StrictStr
+    entity_type: StrictStr
+    summary: StrictStr | None = None
 
 
 class GameState(EngineBaseModel):
@@ -194,7 +247,7 @@ class MutationLog(EngineBaseModel):
 
 
 class ExecutedEvent(EngineBaseModel):
-    """Objective runtime facts passed to the narrator layer."""
+    """Objective runtime facts emitted by tools and preserved for audit."""
 
     event_type: StrictStr
     is_success: StrictBool

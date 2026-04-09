@@ -27,6 +27,14 @@ def build_state() -> GameState:
                 universe_type="Original",
                 tone_and_style="grim and tactical",
             ),
+            world_book={
+                "campaign_context": {
+                    "era_and_timeline": "赛博荒原纪元，边境聚落重建期",
+                    "macro_world_state": "企业废墟仍在释放余波，边境聚落靠武力和配给维持脆弱秩序。",
+                    "looming_crisis": "聚落外环的能源网正在衰竭，下一次断电可能直接引发暴乱。",
+                    "opening_scene": "你在发电站值班室的冷光里惊醒，警报红灯一盏盏亮起，门外已经传来砸门声。",
+                }
+            },
             glossary=WorldGlossary(
                 stats={"stat_hp": "Integrity", "stat_energy": "Charge"},
                 damage_types={"dmg_kinetic": "Kinetic Shock"},

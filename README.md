@@ -1,33 +1,74 @@
-# 通用叙事世界引擎 / Fanfic Sandbox
+# Fanfic Sandbox
 
-一个“**大模型辅助决策 + 严格代码结算**”的中文互动叙事沙盒。
+一个基于 Agent Tool Calling 的中文互动叙事沙盒。
 
-这个项目不是纯 Prompt 聊天机器人，而是一个分层引擎：
+现在的主架构已经统一为一个具备工具调用能力的 `GM Agent`：
 
-- `Central Brain` 只负责意图解析与路由
-- `Pipelines` 只负责代码结算
-- `Narrator` 只负责基于事实做中文叙事包装
-- 所有状态修改都必须经过 `MutationLog -> State Mutator`
+- 大模型直接理解玩家动作
+- 遇到有风险的行为时主动调用工具结算
+- 用工具返回的事实更新状态
+- 最后输出连续、沉浸式的剧情文本
 
-当前前端、后端、中文叙事、战斗、搜刮、动态建图都已经接通，可直接本地试玩。
+底层仍然保留严格的代码结算和 `MutationLog -> State Mutator` 约束，所以它不是纯 Prompt 聊天，也不是让模型随口编结果。
 
-## 当前已实现
+## 当前架构
 
-- 世界初始化 / 同人世界织布机
-- 核心 Schema 与 `State Mutator`
-- `Central Brain` 路由中枢
-- 战斗管线：D20 命中 + 敌人反击
-- 搜刮管线：候选池生成 + 代码掷骰掉落
-- 探索管线：未知地点即时建图 + `topology` 持久化扩张
-- `Narrator` 中文叙事渲染
-- Next.js 多面板控制台
-- 审计面板：`ExecutedEvent` / `MutationLog` / `topology` 快照
+### 1. World Weaver
+
+`/api/world/generate` 会把同人设定编译成 `WorldConfig`。
+
+重点包括：
+
+- `fanfic_meta`
+- `world_book.campaign_context`
+- `glossary`
+- `topology`
+- `mechanics`
+
+### 2. GM Agent
+
+`/api/game/start` 和 `/api/game/action` 都由 `GM Agent` 驱动。
+
+Agent 的职责：
+
+- 读取当前世界锚点、地点、角色状态、最近可见文本
+- 拆解复合动作
+- 连续调用工具
+- 基于工具结果输出最终剧情
+
+### 3. Runtime Tools
+
+当前核心工具：
+
+- `roll_d20_check`
+- `modify_game_state`
+- `inventory_manager`
+
+这些工具会产出客观事实，并在需要时生成 `MutationLog`。
+
+### 4. State Mutator
+
+所有状态变更都必须通过 `MutationLog` 和 `apply_mutations` 落地，避免模型直接乱改状态。
+
+## 项目状态
+
+目前已接通：
+
+- 世界生成
+- Agent 化开局
+- Agent 化行动回合
+- 复合动作多次检定
+- HP / MP / 位置修改
+- 临时物品增删
+- 审计面板
+- Next.js 前端联调
 
 ## 技术栈
 
-- 前端：Next.js 15、React 19、Zustand、TypeScript
-- 后端：FastAPI、Pydantic v2、OpenAI-compatible API client
-- 测试：Pytest
+- Frontend: Next.js 15, React 19, TypeScript, Zustand
+- Backend: FastAPI, Pydantic v2
+- LLM: OpenAI-compatible Chat Completions + tool calling
+- Tests: Pytest
 
 ## 环境要求
 
@@ -35,13 +76,9 @@
 - Node.js 20+
 - npm 10+
 
-本仓库当前在 Windows + PowerShell 环境下验证通过。
+## 安装
 
-## 安装依赖
-
-### 1. Python 依赖
-
-建议先创建虚拟环境：
+### Python
 
 ```powershell
 py -m venv .venv
@@ -50,16 +87,7 @@ py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 ```
 
-如果你用 macOS / Linux，把 `py` 换成 `python3`，激活命令换成：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
-```
-
-### 2. 前端依赖
+### Frontend
 
 ```powershell
 npm install
@@ -67,15 +95,13 @@ npm install
 
 ## 环境变量
 
-项目根目录使用同一个 `.env`，前后端都会读取它。
-
 先复制模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-最少需要这些变量：
+最少需要：
 
 ```env
 LLM_API_KEY=your_key
@@ -84,31 +110,22 @@ LLM_MODEL_NAME=provider/model-name
 ENGINE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-可选变量：
+可选：
 
 ```env
-LLM_REQUEST_TIMEOUT_SECONDS=30
+LLM_REQUEST_TIMEOUT_SECONDS=60
 LLM_JSON_SCHEMA_PREFERRED=true
 ```
 
-说明：
+## 启动
 
-- `LLM_API_KEY`：大模型网关密钥
-- `LLM_BASE_URL`：兼容 OpenAI Chat Completions 的网关地址
-- `LLM_MODEL_NAME`：模型名
-- `ENGINE_API_BASE_URL`：Next.js 代理转发到后端 API 的地址
-
-## 启动方式
-
-### 方式 A：开发联调
-
-先开后端：
+### 后端
 
 ```powershell
 py -m uvicorn server.api.app:app --host 127.0.0.1 --port 8000
 ```
 
-再开前端：
+### 前端
 
 ```powershell
 npm run dev
@@ -116,35 +133,31 @@ npm run dev
 
 启动后访问：
 
-- 前端：`http://127.0.0.1:3000`
-- 后端健康检查：`http://127.0.0.1:8000/health`
-
-### 方式 B：前端生产模式预览
-
-```powershell
-npm run build
-npm run start
-```
-
-后端依然需要单独启动：
-
-```powershell
-py -m uvicorn server.api.app:app --host 127.0.0.1 --port 8000
-```
+- Frontend: `http://127.0.0.1:3000`
+- Health: `http://127.0.0.1:8000/health`
 
 ## 常用命令
 
-### 跑后端测试
+### 跑测试
 
 ```powershell
 py -m pytest -q
 ```
 
-### 验证前端构建
+### 构建前端
 
 ```powershell
 npm run build
 ```
+
+## API
+
+- `POST /api/world/generate`
+- `POST /api/game/start`
+- `POST /api/game/action`
+- `GET /health`
+
+前端默认通过 Next.js 自带路由代理到后端。
 
 ## 项目结构
 
@@ -152,51 +165,34 @@ npm run build
 app/                         Next.js 页面与前端 API 路由
 components/                  前端面板组件
 lib/                         前端状态、类型、格式化工具
+server/agent/gm.py           GM Agent 主循环
+server/agent/runtime_tools.py Agent 可调用工具
 server/api/app.py            FastAPI 主入口
-server/brain/central.py      路由中枢 / 意图解析
-server/schemas/core.py       核心 Pydantic Schema
-server/state/mutator.py      统一状态修改器
 server/initialization/       世界织布机
-server/generators/           候选池生成器 / 动态地图生成器
-server/pipelines/            战斗 / 搜刮 / 探索管线
-server/narrative/narrator.py 叙事渲染引擎
+server/generators/           生成器
+server/llm/                  OpenAI-compatible client
 server/runtime/session_store.py 会话态与运行时附加信息
+server/schemas/core.py       核心 Pydantic Schema
+server/state/mutator.py      状态修改器
 tests/                       后端测试
 ```
 
-## 核心运行规则
+## 运行规则
 
-这几个约束是项目设计底线：
+- 大模型不能直接拍板状态结果，必须通过工具和状态修改器落地
+- 复合动作允许拆成多个子动作分别检定
+- 所有玩家可见输出必须受当前时代和 `campaign_context` 约束
+- 所有关键状态变化都应该能在审计面板中看到
 
-- 大模型不能直接决定战斗结果、掉落结果或任务推进
-- 代码层只使用抽象 Key，不写死世界观名词
-- `Narrator` 只能叙述 `ExecutedEvent`，不能发明事实
-- 所有状态变化必须通过 `MutationLog` 和 `apply_mutations`
+## 当前已知边界
 
-## 当前 API 入口
+- Agent 已接管主运行链路，但底层战斗、掉落、地图等纯代码模块仍在仓库中，可继续复用
+- 审计数据已经能反映多次检定和状态修改，但部分检定目标与场景快照还可以继续细化
+- 如果模型没有足够积极地调用工具，后端有一层强制补结算兜底逻辑
 
-- `POST /api/world/generate`
-- `POST /api/game/start`
-- `POST /api/game/action`
-- `GET /health`
+## 示例输入
 
-前端默认通过 Next.js 自带的代理路由转发到后端：
-
-- `/api/world/generate`
-- `/api/game/start`
-- `/api/game/action`
-
-## 当前可直接试玩的输入示例
-
-- `我拔出武器攻击敌人`
-- `我仔细搜查倒下的敌人尸体`
-- `查看我的状态`
-- `去后山的神秘山洞`
-- `去山洞深处的祭坛`
-- `去祭坛下的暗道`
-
-## 备注
-
-- 玩家可见前端文案与叙事输出已切为简体中文
-- 审计面板会展示事实日志与地图增长过程，方便观察“代码结算而不是模型胡编”
-- 如果未来重新初始化 Git 仓库，优先从 `server/api/app.py`、`server/brain/central.py`、`server/pipelines/` 和本 README 继续接续开发
+- `我假装投降，然后突然用魔杖射击天花板上的吊灯砸他，接着给自己加个护盾。`
+- `我翻过柜台躲开扑击，再顺手抄起地上的铁管砸它膝盖。`
+- `我先检查训练场地面上的刮痕，再顺着痕迹往树林方向追。`
+- `我把刚捡到的护符塞进怀里，然后立刻往紧急出口跑。`

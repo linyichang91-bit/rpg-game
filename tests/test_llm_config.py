@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from server.brain.central import CentralBrain, build_central_brain_from_env
+from server.agent.gm import GameMasterAgent, build_gm_agent_from_env
 from server.llm.config import LLMSettings, LLMSettingsError
 from server.llm.openai_compatible import OpenAICompatibleJSONClient
 
@@ -111,10 +111,10 @@ def test_openai_compatible_client_falls_back_to_json_object() -> None:
     assert calls[1]["response_format"]["type"] == "json_object"
 
 
-def test_build_central_brain_from_env_returns_ready_instance(tmp_path: Path) -> None:
+def test_build_gm_agent_from_env_returns_ready_instance(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     write_env_file(env_file)
 
-    brain = build_central_brain_from_env(env_file=str(env_file))
+    agent = build_gm_agent_from_env(env_file=str(env_file))
 
-    assert isinstance(brain, CentralBrain)
+    assert isinstance(agent, GameMasterAgent)
