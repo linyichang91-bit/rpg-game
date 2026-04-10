@@ -1,73 +1,85 @@
 # Fanfic Sandbox
 
-一个基于 Agent Tool Calling 的中文互动叙事沙盒。
+一个面向中文互动叙事的同人 RPG 沙盒。
 
-现在的主架构已经统一为一个具备工具调用能力的 `GM Agent`：
+它不是单纯的“聊天式跑团”，而是一套前后端分离的互动叙事系统：
 
-- 大模型直接理解玩家动作
-- 遇到有风险的行为时主动调用工具结算
-- 用工具返回的事实更新状态
-- 最后输出连续、沉浸式的剧情文本
+- 前端负责世界生成入口、叙事面板、状态面板、审计面板和本地存档槽位
+- 后端负责世界编织、会话状态、GM Agent、工具调用和状态结算
+- 大模型负责理解玩家意图、驱动工具链并输出最终叙事
 
-底层仍然保留严格的代码结算和 `MutationLog -> State Mutator` 约束，所以它不是纯 Prompt 聊天，也不是让模型随口编结果。
+当前项目已经支持从“设定一句话”直接进入可游玩的开局场景，并支持后续自由输入、读档、重置和持续推进。
+
+## 主要能力
+
+- 世界生成：把用户输入的同人设定编译成结构化 `WorldConfig`
+- 开场生成：生成可直接进入游玩的序章 / 第一幕
+- Agent 回合驱动：通过 GM Agent 调用工具、解析动作、输出叙事
+- 状态结算：HP / MP / 物品 / 任务 / 遭遇 / 位置变化通过后端状态层落地
+- 审计面板：前端可查看本回合执行事件与状态变更
+- 本地存档槽：支持手动存档、读档、删除存档、清空全部存档
+- 会话恢复：读档后会在后端恢复成新的有效会话，而不是只恢复前端画面
+- 会话重置：支持重置当前冒险，回到开局界面
 
 ## 当前架构
 
 ### 1. World Weaver
 
-`/api/world/generate` 会把同人设定编译成 `WorldConfig`。
+`POST /api/world/generate`
 
-重点包括：
+负责把用户的同人 prompt 转成后端可运行的世界配置，包括：
 
 - `fanfic_meta`
 - `world_book.campaign_context`
 - `glossary`
 - `topology`
 - `mechanics`
+- `initial_quests`
+
+同时会生成长篇开场序章文本。
 
 ### 2. GM Agent
 
-`/api/game/start` 和 `/api/game/action` 都由 `GM Agent` 驱动。
+`POST /api/game/start`  
+`POST /api/game/action`
 
-Agent 的职责：
+GM Agent 会基于当前状态快照：
 
-- 读取当前世界锚点、地点、角色状态、最近可见文本
-- 拆解复合动作
-- 连续调用工具
-- 基于工具结果输出最终剧情
+- 理解玩家输入
+- 判断是否需要工具调用
+- 通过运行时工具完成风险结算
+- 提交状态变化
+- 输出最终的玩家可见叙事
 
 ### 3. Runtime Tools
 
-当前核心工具：
+当前核心运行时工具包含：
 
 - `roll_d20_check`
 - `modify_game_state`
 - `inventory_manager`
+- `resolve_combat_action`
+- `resolve_exploration_action`
+- `resolve_loot_action`
+- `update_quest_state`
+- `update_encounter_state`
 
-这些工具会产出客观事实，并在需要时生成 `MutationLog`。
+### 4. Session Store
 
-### 4. State Mutator
+会话状态由后端内存态 `SessionStore` 管理，前端本地还会额外持久化：
 
-所有状态变更都必须通过 `MutationLog` 和 `apply_mutations` 落地，避免模型直接乱改状态。
+- 当前会话快照
+- 叙事日志
+- 审计日志
+- 手动存档槽
 
-## 项目状态
-
-目前已接通：
-
-- 世界生成
-- Agent 化开局
-- Agent 化行动回合
-- 复合动作多次检定
-- HP / MP / 位置修改
-- 临时物品增删
-- 审计面板
-- Next.js 前端联调
+读档时会调用后端恢复接口，重新生成一个新的 `session_id`，保证之后还能继续结算。
 
 ## 技术栈
 
 - Frontend: Next.js 15, React 19, TypeScript, Zustand
 - Backend: FastAPI, Pydantic v2
-- LLM: OpenAI-compatible Chat Completions + tool calling
+- LLM: OpenAI-compatible Chat Completions / Tool Calling
 - Tests: Pytest
 
 ## 环境要求
@@ -76,9 +88,11 @@ Agent 的职责：
 - Node.js 20+
 - npm 10+
 
-## 安装
+## 快速开始
 
-### Python
+### 1. 安装依赖
+
+Python 依赖：
 
 ```powershell
 py -m venv .venv
@@ -87,21 +101,21 @@ py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 ```
 
-### Frontend
+前端依赖：
 
 ```powershell
 npm install
 ```
 
-## 环境变量
+### 2. 配置环境变量
 
-先复制模板：
+复制模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-最少需要：
+最少需要这些变量：
 
 ```env
 LLM_API_KEY=your_key
@@ -110,89 +124,153 @@ LLM_MODEL_NAME=provider/model-name
 ENGINE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-可选：
+可选项：
 
 ```env
-LLM_REQUEST_TIMEOUT_SECONDS=60
+LLM_REQUEST_TIMEOUT_SECONDS=30
 LLM_JSON_SCHEMA_PREFERRED=true
 ```
 
-## 启动
+### 3. 启动项目
 
-### 后端
+#### 方案 A：手动分别启动
+
+后端：
 
 ```powershell
-py -m uvicorn server.api.app:app --host 127.0.0.1 --port 8000
+.venv\Scripts\python.exe -m uvicorn server.api.app:app --host 127.0.0.1 --port 8000
 ```
 
-### 前端
+前端：
 
 ```powershell
 npm run dev
 ```
 
+#### 方案 B：使用项目脚本启动
+
+仓库里提供了 Windows PowerShell 脚本：
+
+- `scripts/Set-ProjectEnv.ps1`
+- `scripts/Start-Dev.ps1`
+
+其中：
+
+- `Set-ProjectEnv.ps1` 会注入 UTF-8 控制台编码和项目本地工具链路径
+- `Start-Dev.ps1` 会同时拉起前后端，并把日志写到 `backend.log` / `frontend.log`
+
+启动命令：
+
+```powershell
+powershell.exe -NoLogo -ExecutionPolicy Bypass -File .\scripts\Start-Dev.ps1
+```
+
 启动后访问：
 
 - Frontend: `http://127.0.0.1:3000`
-- Health: `http://127.0.0.1:8000/health`
+- Backend health: `http://127.0.0.1:8000/health`
 
 ## 常用命令
 
-### 跑测试
+运行测试：
 
 ```powershell
-py -m pytest -q
+.venv\Scripts\python.exe -m pytest -q
 ```
 
-### 构建前端
+仅跑关键 API / Agent 测试：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_api_app.py tests/test_gm_agent.py
+```
+
+前端生产构建：
 
 ```powershell
 npm run build
 ```
 
-## API
+## API 概览
 
+### 世界与会话
+
+- `GET /health`
 - `POST /api/world/generate`
 - `POST /api/game/start`
 - `POST /api/game/action`
-- `GET /health`
 
-前端默认通过 Next.js 自带路由代理到后端。
+### 存档与恢复
+
+- `POST /api/game/save`
+- `POST /api/game/restore`
+- `POST /api/game/reset`
+
+前端默认通过 Next.js 的 `/app/api/*` 路由代理到后端 `ENGINE_API_BASE_URL`。
+
+## 前端界面
+
+当前前端主要由以下几个区域组成：
+
+- 创世界面：输入同人设定并生成世界
+- 叙事剧场：展示系统旁白与玩家输入
+- 状态面板：展示属性、物品、任务、遭遇、位置
+- 审计面板：查看本回合工具执行与状态变更
+- 档案舱：手动存档、读档、删除、清空本地存档、重置当前会话
 
 ## 项目结构
 
 ```text
-app/                         Next.js 页面与前端 API 路由
-components/                  前端面板组件
-lib/                         前端状态、类型、格式化工具
-server/agent/gm.py           GM Agent 主循环
-server/agent/runtime_tools.py Agent 可调用工具
-server/api/app.py            FastAPI 主入口
-server/initialization/       世界织布机
-server/generators/           生成器
-server/llm/                  OpenAI-compatible client
-server/runtime/session_store.py 会话态与运行时附加信息
-server/schemas/core.py       核心 Pydantic Schema
-server/state/mutator.py      状态修改器
-tests/                       后端测试
+app/                              Next.js 页面与 API 代理路由
+components/                       前端 UI 组件
+lib/                              前端状态、类型、API 封装
+scripts/                          Windows 启动与环境脚本
+server/api/app.py                 FastAPI 入口
+server/agent/gm.py                GM Agent 主流程
+server/agent/runtime_tools.py     Agent 可调用的运行时工具
+server/initialization/            World Weaver 与开场生成
+server/runtime/session_store.py   会话状态与恢复逻辑
+server/schemas/core.py            核心 Pydantic Schema
+server/state/mutator.py           状态修改器
+server/generators/                地图 / 掉落等生成器
+tests/                            后端测试
 ```
 
-## 运行规则
+## 设计约束
 
-- 大模型不能直接拍板状态结果，必须通过工具和状态修改器落地
-- 复合动作允许拆成多个子动作分别检定
-- 所有玩家可见输出必须受当前时代和 `campaign_context` 约束
-- 所有关键状态变化都应该能在审计面板中看到
+- 模型不能直接随意篡改状态，关键状态变更必须经过后端工具和状态层
+- 叙事输出必须服从世界锚点、当前地点、当前会话状态
+- 玩家复合动作允许拆分成多个子动作分别结算
+- 读档恢复后必须继续能玩，而不是只恢复前端日志
+- 所有关键回合变化应能在审计面板中追踪
 
-## 当前已知边界
+## 当前已实现
 
-- Agent 已接管主运行链路，但底层战斗、掉落、地图等纯代码模块仍在仓库中，可继续复用
-- 审计数据已经能反映多次检定和状态修改，但部分检定目标与场景快照还可以继续细化
-- 如果模型没有足够积极地调用工具，后端有一层强制补结算兜底逻辑
+- 世界生成
+- 开场叙事
+- 玩家自由输入回合推进
+- 基础战斗 / 探索 / 搜刮工具链
+- 任务与遭遇状态更新
+- 审计追踪
+- 手动存档 / 读档 / 删除 / 清空本地存档
+- 当前会话重置
+
+## 已知边界
+
+- 当前后端 `SessionStore` 仍是内存态；服务端进程重启后，旧会话会失效，但手动存档仍可重新恢复
+- LLM 网关质量会直接影响叙事质量、工具调用积极性和开场长度
+- 目前没有数据库版永久存档，存档槽位保存在浏览器本地 `localStorage`
+- 部分旧文件里仍存在历史编码问题，README 已重写为正常 UTF-8 中文
 
 ## 示例输入
 
-- `我假装投降，然后突然用魔杖射击天花板上的吊灯砸他，接着给自己加个护盾。`
-- `我翻过柜台躲开扑击，再顺手抄起地上的铁管砸它膝盖。`
-- `我先检查训练场地面上的刮痕，再顺着痕迹往树林方向追。`
-- `我把刚捡到的护符塞进怀里，然后立刻往紧急出口跑。`
+- `咒术回战同人，主角在 2018 年 5 月 1 日入学东京咒术高专，拥有投影与强化能力，开场就在宿舍醒来。`
+- `火影忍者 AU，主角是木叶下忍，在中忍考试前夜被卷入一场针对村子的阴谋。`
+- `哈利波特现代 AU，主角是麻瓜出身的新生，被迫在开学列车上第一次接触魔法世界。`
+
+## 后续方向
+
+- 自动存档 / 快速存档
+- 更完整的地图与探索分支
+- 更丰富的掉落、装备和任务系统
+- 持久化数据库存档
+- 更稳定的中文编码与本地开发体验
