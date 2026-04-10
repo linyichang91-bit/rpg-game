@@ -17,11 +17,17 @@ __pycache__/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 .runlogs/
 coverage/
 dist/
 build/
+.npm-cache/
+
+# Local toolchains and installers
+.tools/
+downloads/
 
 .DS_Store
 Thumbs.db
