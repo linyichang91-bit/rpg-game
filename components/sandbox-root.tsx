@@ -2,6 +2,7 @@
 
 import { GenesisView } from "@/components/genesis-view";
 import { SandboxConsole } from "@/components/sandbox-console";
+import { SessionVault } from "@/components/session-vault";
 import { useSandboxStore } from "@/lib/store";
 
 export function SandboxRoot() {
@@ -26,6 +27,8 @@ export function SandboxRoot() {
           </button>
         </div>
       ) : null}
+
+      <SessionVault />
 
       {gameState ? <SandboxConsole /> : <GenesisView />}
 

@@ -205,6 +205,50 @@ class ContextEntity(EngineBaseModel):
     summary: StrictStr | None = None
 
 
+QuestStatus = Literal["active", "completed", "failed"]
+EncounterStatus = Literal["active", "resolved", "escaped"]
+
+
+class QuestState(EngineBaseModel):
+    """Runtime quest tracked independently from static world generation seeds."""
+
+    quest_id: StrictStr
+    title: StrictStr
+    status: QuestStatus = "active"
+    summary: StrictStr | None = None
+    progress: StrictInt = 0
+
+    @field_validator("quest_id")
+    @classmethod
+    def validate_quest_id(cls, value: str) -> str:
+        if not ABSTRACT_KEY_PATTERN.fullmatch(value):
+            raise ValueError("QuestState.quest_id must be a lowercase abstract key.")
+        return value
+
+
+class EncounterState(EngineBaseModel):
+    """Persistent record describing an encounter beyond the live enemy map."""
+
+    encounter_id: StrictStr
+    label: StrictStr
+    status: EncounterStatus = "active"
+    location_id: StrictStr
+    enemy_ids: list[StrictStr] = Field(default_factory=list)
+    summary: StrictStr | None = None
+
+    @field_validator("encounter_id", "location_id")
+    @classmethod
+    def validate_encounter_keys(cls, value: str) -> str:
+        if not ABSTRACT_KEY_PATTERN.fullmatch(value):
+            raise ValueError("EncounterState keys must be lowercase abstract identifiers.")
+        return value
+
+    @field_validator("enemy_ids")
+    @classmethod
+    def validate_enemy_ids(cls, value: list[str]) -> list[str]:
+        return _validate_abstract_key_list(value, "enemy_ids")
+
+
 class GameState(EngineBaseModel):
     """Single source of truth snapshot for the current session."""
 
@@ -213,15 +257,18 @@ class GameState(EngineBaseModel):
     current_location_id: StrictStr
     active_encounter: StrictStr | None = None
     encounter_entities: dict[str, RuntimeEntityState] = Field(default_factory=dict)
+    quest_log: dict[str, QuestState] = Field(default_factory=dict)
+    encounter_log: dict[str, EncounterState] = Field(default_factory=dict)
     world_config: WorldConfig
 
-    @field_validator("encounter_entities")
+    @field_validator("encounter_entities", "quest_log", "encounter_log")
     @classmethod
-    def validate_encounter_entity_keys(
+    def validate_runtime_mapping_keys(
         cls,
-        value: dict[str, RuntimeEntityState],
-    ) -> dict[str, RuntimeEntityState]:
-        return _validate_abstract_mapping_keys(value, "encounter_entities")
+        value: dict[str, Any],
+        info: Any,
+    ) -> dict[str, Any]:
+        return _validate_abstract_mapping_keys(value, info.field_name)
 
 
 MutationAction = Literal["add", "subtract", "set", "delete", "append"]

@@ -49,6 +49,9 @@ export interface WorldConfig {
   topology: WorldTopology;
 }
 
+export type QuestStatus = "active" | "completed" | "failed";
+export type EncounterStatus = "active" | "resolved" | "escaped";
+
 export interface TimingStage {
   stage_id: string;
   label: string;
@@ -73,13 +76,47 @@ export interface RuntimeEntityState {
   tags: string[];
 }
 
+export interface QuestState {
+  quest_id: string;
+  title: string;
+  status: QuestStatus;
+  summary?: string | null;
+  progress: number;
+}
+
+export interface EncounterState {
+  encounter_id: string;
+  label: string;
+  status: EncounterStatus;
+  location_id: string;
+  enemy_ids: string[];
+  summary?: string | null;
+}
+
 export interface GameState {
   session_id: string;
   player: PlayerState;
   current_location_id: string;
   active_encounter?: string | null;
   encounter_entities: Record<string, RuntimeEntityState>;
+  quest_log?: Record<string, QuestState>;
+  encounter_log?: Record<string, EncounterState>;
   world_config: WorldConfig;
+}
+
+export interface ContextEntitySnapshot {
+  entity_id: string;
+  display_name: string;
+  entity_type: string;
+  summary?: string | null;
+}
+
+export interface LootTargetSnapshot {
+  target_id: string;
+  display_name: string;
+  entity_type: string;
+  summary: string;
+  source_enemy_id?: string | null;
 }
 
 export interface MutationLog {
@@ -114,14 +151,69 @@ export interface AuditPacket {
   topology_snapshot?: WorldTopology | null;
 }
 
+export interface RuntimeSessionSnapshot {
+  recent_visible_text?: string | null;
+  nearby_npcs: ContextEntitySnapshot[];
+  encounter_names: Record<string, string>;
+  lootable_targets: Record<string, LootTargetSnapshot>;
+  temp_item_counter: number;
+  dynamic_location_counter: number;
+}
+
+export interface SaveSnapshot {
+  version: number;
+  world_prompt: string;
+  game_state: GameState;
+  story_logs: StoryLog[];
+  audit_trail: AuditPacket[];
+  audit_panel_open: boolean;
+  runtime_snapshot: RuntimeSessionSnapshot;
+}
+
+export interface SaveSlot {
+  id: string;
+  label: string;
+  saved_at: number;
+  snapshot: SaveSnapshot;
+}
+
 export interface WorldGenerateResponse {
   world_config: WorldConfig;
+  prologue_text?: string | null;
   telemetry?: RequestTelemetry | null;
 }
 
 export interface GameStartRequest {
   world_config: WorldConfig;
   world_prompt?: string;
+  prologue_text?: string | null;
+}
+
+export interface GameSaveRequest {
+  session_id: string;
+}
+
+export interface GameSaveResponse {
+  runtime_snapshot: RuntimeSessionSnapshot;
+}
+
+export interface GameRestoreRequest {
+  world_prompt?: string;
+  game_state: GameState;
+  runtime_snapshot: RuntimeSessionSnapshot;
+}
+
+export interface GameRestoreResponse {
+  session_id: string;
+  current_state: GameState;
+}
+
+export interface GameResetRequest {
+  session_id: string;
+}
+
+export interface GameResetResponse {
+  ok: boolean;
 }
 
 export interface GameTurnResponse {

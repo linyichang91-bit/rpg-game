@@ -165,7 +165,8 @@ export function GenesisView() {
       const startStartedAt = performance.now();
       const startResponse = await startGame({
         world_config: worldResponse.world_config,
-        world_prompt: trimmedPrompt
+        world_prompt: trimmedPrompt,
+        prologue_text: worldResponse.prologue_text ?? null
       });
       const openingDurationMs =
         startResponse.telemetry?.total_ms ??

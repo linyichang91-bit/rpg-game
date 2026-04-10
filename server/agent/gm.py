@@ -1,8 +1,9 @@
-"""Agentic GM loop built on top of OpenAI-compatible tool calling."""
+﻿"""Agentic GM loop built on top of OpenAI-compatible tool calling."""
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from textwrap import dedent
 from typing import Any, Protocol
@@ -159,6 +160,31 @@ class GameMasterAgent:
                     )
                     continue
 
+                rewrite_instruction = _build_narrative_rewrite_instruction(narration)
+                if rewrite_instruction is not None:
+                    messages.append(assistant_message)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": rewrite_instruction,
+                        }
+                    )
+                    continue
+
+                length_instruction = _build_narrative_length_instruction(
+                    narration=narration,
+                    opening_mode=False,
+                )
+                if length_instruction is not None:
+                    messages.append(assistant_message)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": length_instruction,
+                        }
+                    )
+                    continue
+
                 commit_session_record(working_record, record)
                 return AgentTurnResult(
                     narration=narration,
@@ -203,34 +229,41 @@ def _build_system_prompt(record: SessionRecord, *, opening_mode: bool) -> str:
     campaign_context = record.game_state.world_config.world_book.campaign_context
     return dedent(
         f"""
-        You are a ruthless, immersive tabletop GM for a fanfiction sandbox.
-        You are not a classifier and not a passive narrator. You must interpret the player's declared move,
-        call tools whenever resolution is needed, and only then write one continuous scene.
+        You are the lead writer and scene director of an interactive novel, not a menu-based game host.
+        Resolve actions with tools, then write publish-grade prose in Simplified Chinese.
 
-        World anchors you must never violate:
+        Canon anchors you must respect:
         - Era and timeline: {campaign_context.era_and_timeline}
         - Macro world state: {campaign_context.macro_world_state}
         - Looming crisis: {campaign_context.looming_crisis}
 
-        Mandatory rules:
-        1. Any risky action must be resolved with roll_d20_check before you narrate its outcome.
-        2. Any HP, MP, inventory, or location change must be committed through the proper tool first.
-        3. Compound actions must be split into multiple sub-actions. Do not flatten them into one vague roll.
-        4. Do not stop after the first failure if later sub-actions could still happen.
-        5. Do not replace the player's declared move with a different move. Resolve what the player actually tried.
-        6. Never invent concrete damage, resource loss, movement, item transfer, or deaths without tool support.
-        7. Short replies such as A, B, C, left, dodge, or yes must be interpreted against the recent visible text.
-        8. Never expose tool names, raw JSON, internal ids, abstract keys, or backend paths.
+        Tool and state discipline:
+        1. Risky actions must be resolved via tools before narration.
+        2. Use specialized tools when applicable: resolve_combat_action, resolve_exploration_action, resolve_loot_action.
+        3. Any HP/MP/inventory/location/quest/encounter change must be committed through tools first.
+        4. Compound player actions must be resolved as multiple sub-actions, never flattened.
+        5. Do not replace the player's declared move with a different move.
+        6. Never expose tool names, raw JSON, internal ids, or backend paths.
+        7. Use update_quest_state for meaningful objective shifts. Avoid creating extra quests for small updates.
+        8. Use update_encounter_state when pacing should transition away from pure combat.
 
-        Tone rules:
-        - All player-facing narration must be written in Simplified Chinese.
-        - Keep the prose tense, physical, and immediate.
-        - Respect canon-era boundaries strictly.
+        Director mindset:
+        9. Combat is not a mandatory HP race. Dramatic actions may interrupt combat and trigger dialogue or standoff.
+        10. NPCs must react with human motives (doubt, fear, curiosity, anger, restraint).
+        11. Unless this is a literal split-second crisis, never end with rigid A/B/C menus.
+        12. Before final narration, silently evaluate:
+            <scene_eval>Should this scene stay in combat, or transition to dialogue/plot tension now?</scene_eval>
+            Never output this tag.
 
-        {"This is the opening scene. The very first sentence must land inside the configured opening_scene and end on a pressure hook." if opening_mode else "This is a live turn. Resolve as much as you honestly can, use multiple tool calls when needed, then narrate the result."}
+        Interactive novel writing rules:
+        13. Each live-turn response should read like a complete micro-chapter, ideally 500-800 Chinese characters.
+        14. Include: visceral action detail, environment interaction, and NPC reaction/dialogue with psychology.
+        15. Never expose numeric stat updates in prose; express consequences physically and emotionally.
+        16. End with a natural suspense hook that invites freeform player input.
+
+        {"This is the opening scene. Start inside the configured opening_scene immediately, include sensory immersion, and end on a pressure hook." if opening_mode else "This is a live turn. Resolve as much as honestly possible via tools, then narrate one continuous immersive chapter segment."}
         """
     ).strip()
-
 
 def _build_opening_user_prompt(record: SessionRecord, user_input: str) -> str:
     campaign_context = record.game_state.world_config.world_book.campaign_context
@@ -262,6 +295,7 @@ def _build_turn_user_prompt(record: SessionRecord, user_input: str) -> str:
     current_location_title = current_node.title if current_node is not None else record.game_state.current_location_id
     current_location_desc = current_node.base_desc if current_node is not None else record.location_summary
     connected_locations = _build_connected_location_snapshot(record)
+    active_encounter = _build_active_encounter_snapshot(record)
 
     prompt_payload = {
         "player_input": user_input,
@@ -287,7 +321,17 @@ def _build_turn_user_prompt(record: SessionRecord, user_input: str) -> str:
             for entity in record.build_nearby_entities()
         ],
         "connected_locations": connected_locations,
-        "active_quests": record.game_state.world_config.initial_quests,
+        "active_encounter": active_encounter,
+        "quest_log": [
+            {
+                "quest_id": quest.quest_id,
+                "title": quest.title,
+                "status": quest.status,
+                "summary": quest.summary,
+                "progress": quest.progress,
+            }
+            for quest in record.game_state.quest_log.values()
+        ],
     }
     return dedent(
         f"""
@@ -315,6 +359,29 @@ def _build_connected_location_snapshot(record: SessionRecord) -> list[dict[str, 
             }
         )
     return results
+
+
+def _build_active_encounter_snapshot(record: SessionRecord) -> dict[str, Any] | None:
+    active_encounter_id = record.game_state.active_encounter
+    if not active_encounter_id:
+        return None
+
+    encounter = record.game_state.encounter_log.get(active_encounter_id)
+    if encounter is None:
+        return {
+            "encounter_id": active_encounter_id,
+            "status": "active",
+            "enemy_ids": sorted(record.game_state.encounter_entities.keys()),
+        }
+
+    return {
+        "encounter_id": encounter.encounter_id,
+        "label": encounter.label,
+        "status": encounter.status,
+        "summary": encounter.summary,
+        "enemy_ids": encounter.enemy_ids,
+        "location_id": encounter.location_id,
+    }
 
 
 def _format_nearby_entities(record: SessionRecord) -> str:
@@ -413,15 +480,21 @@ def _build_missing_resolution_instruction(
 ) -> str | None:
     requirements = _infer_resolution_requirements(user_input)
     skill_check_count = sum(1 for event in executed_events if event.event_type == "skill_check")
+    specialized_resolution_count = sum(
+        1
+        for event in executed_events
+        if event.event_type in {"combat", "exploration", "loot"}
+    )
+    resolved_risk_count = skill_check_count + specialized_resolution_count
     has_mp_change = any(
         event.event_type == "state_change" and "mp_changed" in event.result_tags
         for event in executed_events
     )
 
     missing_items: list[str] = []
-    if skill_check_count < requirements["min_skill_checks"]:
+    if resolved_risk_count < requirements["min_skill_checks"]:
         missing_items.append(
-            f"the player declared multiple risky sub-actions, and you still owe {requirements['min_skill_checks'] - skill_check_count} more roll_d20_check call(s)"
+            f"the player declared multiple risky sub-actions, and you still owe {requirements['min_skill_checks'] - resolved_risk_count} more risky resolution step(s)"
         )
     if requirements["needs_mp_change"] and not has_mp_change:
         missing_items.append(
@@ -438,6 +511,63 @@ def _build_missing_resolution_instruction(
         f"{details}"
     )
 
+
+def _build_narrative_rewrite_instruction(narration: str) -> str | None:
+    if _looks_like_rigid_menu_ending(narration):
+        return (
+            "Rewrite your last narration in Simplified Chinese while preserving all resolved facts and consequences. "
+            "Do not append rigid action menus or numbered options. End on a natural dramatic hook that invites "
+            "freeform player input."
+        )
+    return None
+
+
+def _build_narrative_length_instruction(
+    *,
+    narration: str,
+    opening_mode: bool,
+) -> str | None:
+    minimum_characters = 380 if opening_mode else 500
+    visible_characters = _count_visible_characters(narration)
+    if visible_characters >= minimum_characters:
+        return None
+
+    return (
+        "Expand your previous narration in Simplified Chinese without changing factual outcomes from tool observations. "
+        "Keep continuity, deepen movement detail, environment interaction, and NPC emotional reaction. "
+        f"Return at least {minimum_characters} visible Chinese characters and end with a natural suspense hook."
+    )
+
+
+def _looks_like_rigid_menu_ending(narration: str) -> bool:
+    compact = narration.strip().lower()
+    if not compact:
+        return False
+
+    menu_markers = (
+        "请选择",
+        "选择你的行动",
+        "选择你的应对",
+        "可选行动",
+        "选项：",
+        "option:",
+        "choose your action",
+    )
+    if any(marker in compact for marker in menu_markers):
+        return True
+
+    ending_window = compact[-140:]
+    if re.search(r"(?:^|\n)\s*[a-dＡ-Ｄ][\.:、\)\s]", ending_window):
+        return True
+    if re.search(r"\[[^\]]{0,40}(?:请选择|选项|action)[^\]]{0,40}\]$", ending_window):
+        return True
+    if re.search(r"【[^】]{0,50}(?:请选择|选项|行动)[^】]{0,50}】$", ending_window):
+        return True
+    return False
+
+
+def _count_visible_characters(text: str) -> int:
+    return sum(1 for char in text if not char.isspace())
 
 def _infer_resolution_requirements(user_input: str) -> dict[str, int | bool]:
     normalized = user_input.strip()
@@ -512,3 +642,6 @@ def _infer_resolution_requirements(user_input: str) -> dict[str, int | bool]:
         "min_skill_checks": min_skill_checks,
         "needs_mp_change": needs_mp_change,
     }
+
+
+

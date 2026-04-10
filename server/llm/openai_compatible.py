@@ -111,6 +111,29 @@ class OpenAICompatibleJSONClient:
                 raise LLMGatewayError("LLM 网关请求失败。") from exc
             raise LLMGatewayError("LLM 网关请求失败。") from exc
 
+    def generate_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.85,
+    ) -> str:
+        """Request plain narrative text through the same sync OpenAI-compatible gateway."""
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self._settings.model_name,
+                messages=self._build_messages(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                ),
+                temperature=temperature,
+            )
+        except Exception as exc:
+            raise LLMGatewayError("LLM gateway request failed.") from exc
+
+        return _extract_text_content(response).strip()
+
     def _create_completion(
         self,
         *,

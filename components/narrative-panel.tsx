@@ -56,19 +56,12 @@ export function NarrativePanel({
 
       <div className="narrative-scroller" ref={scrollerRef}>
         {storyLogs.length === 0 ? (
-          <p className="empty-copy centered">
-            舞台已经就绪，等待你的第一条指令。
-          </p>
+          <p className="empty-copy centered">舞台已经就绪，等待你的第一条行动。</p>
         ) : null}
 
         {storyLogs.map((entry) => (
-          <article
-            className={`story-line story-${entry.role}`}
-            key={entry.id}
-          >
-            <span className="story-role">
-              {entry.role === "user" ? "你" : "旁白"}
-            </span>
+          <article className={`story-line story-${entry.role}`} key={entry.id}>
+            <span className="story-role">{entry.role === "user" ? "你" : "旁白"}</span>
             {entry.role === "system" ? (
               <TypewriterText
                 text={entry.text}
@@ -76,7 +69,9 @@ export function NarrativePanel({
                 className="story-text"
               />
             ) : (
-              <span className="story-text">{entry.text}</span>
+              <div className="story-text">
+                <p className="story-paragraph story-paragraph-user">{entry.text}</p>
+              </div>
             )}
           </article>
         ))}
@@ -84,11 +79,7 @@ export function NarrativePanel({
       </div>
 
       <div className="narrative-terminal">
-        {isLoading ? (
-          <div className="narrative-loading">
-            引擎正在结算规则与叙事……
-          </div>
-        ) : null}
+        {isLoading ? <div className="narrative-loading">引擎正在结算规则与叙事…</div> : null}
         {children}
       </div>
     </section>

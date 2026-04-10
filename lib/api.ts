@@ -1,5 +1,11 @@
 import type {
   GameActionRequest,
+  GameResetRequest,
+  GameResetResponse,
+  GameRestoreRequest,
+  GameRestoreResponse,
+  GameSaveRequest,
+  GameSaveResponse,
   GameStartRequest,
   GameTurnResponse,
   WorldGenerateResponse
@@ -55,4 +61,22 @@ export function submitAction(
   payload: GameActionRequest
 ): Promise<GameTurnResponse> {
   return postJson<GameTurnResponse>("/api/game/action", payload);
+}
+
+export function exportGameSave(
+  payload: GameSaveRequest
+): Promise<GameSaveResponse> {
+  return postJson<GameSaveResponse>("/api/game/save", payload);
+}
+
+export function restoreGame(
+  payload: GameRestoreRequest
+): Promise<GameRestoreResponse> {
+  return postJson<GameRestoreResponse>("/api/game/restore", payload);
+}
+
+export function resetGameSession(
+  payload: GameResetRequest
+): Promise<GameResetResponse> {
+  return postJson<GameResetResponse>("/api/game/reset", payload);
 }

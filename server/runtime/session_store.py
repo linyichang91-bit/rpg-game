@@ -8,8 +8,10 @@ from uuid import uuid4
 
 from server.schemas.core import (
     ContextEntity,
+    EncounterState,
     GameState,
     PlayerState,
+    QuestState,
     RuntimeEntityState,
     WorldConfig,
     WorldNode,
@@ -94,6 +96,10 @@ class SessionRecord:
             for entity_id, name in self.encounter_names.items()
             if entity_id in live_ids
         }
+        active_encounter_id = self.game_state.active_encounter
+        if active_encounter_id and active_encounter_id in self.game_state.encounter_log:
+            encounter_state = self.game_state.encounter_log[active_encounter_id]
+            encounter_state.enemy_ids = sorted(live_ids)
         self.location_summary = _build_location_summary(
             self.game_state.world_config,
             self.game_state.current_location_id,
@@ -178,6 +184,17 @@ class SessionStore:
             current_location_id=prepared_world_config.topology.start_node_id,
             active_encounter="encounter_opening",
             encounter_entities=encounter_entities,
+            quest_log=_build_initial_quest_log(prepared_world_config),
+            encounter_log={
+                "encounter_opening": EncounterState(
+                    encounter_id="encounter_opening",
+                    label=primary_enemy_name,
+                    status="active",
+                    location_id=prepared_world_config.topology.start_node_id,
+                    enemy_ids=sorted(encounter_entities.keys()),
+                    summary=f"A dangerous opening clash against {primary_enemy_name}.",
+                )
+            },
             world_config=prepared_world_config,
         )
 
@@ -198,6 +215,47 @@ class SessionStore:
 
         return record
 
+    def restore_session(
+        self,
+        game_state: GameState,
+        *,
+        world_prompt: str | None = None,
+        recent_visible_text: str | None = None,
+        nearby_npcs: list[ContextEntity] | None = None,
+        encounter_names: dict[str, str] | None = None,
+        lootable_targets: dict[str, LootTarget] | None = None,
+        temp_item_counter: int = 0,
+        dynamic_location_counter: int = 0,
+    ) -> SessionRecord:
+        """Rebuild a playable session record from a previously exported snapshot."""
+
+        session_id = f"session_{uuid4().hex[:12]}"
+        restored_state = game_state.model_copy(deep=True)
+        restored_state.session_id = session_id
+        restored_state.world_config = _ensure_world_topology(restored_state.world_config)
+
+        record = SessionRecord(
+            session_id=session_id,
+            game_state=restored_state,
+            world_prompt=world_prompt,
+            location_summary=_build_location_summary(
+                restored_state.world_config,
+                restored_state.current_location_id,
+            ),
+            recent_visible_text=recent_visible_text.strip() if recent_visible_text else None,
+            nearby_npcs=list(nearby_npcs or []),
+            encounter_names=dict(encounter_names or {}),
+            lootable_targets=dict(lootable_targets or {}),
+            temp_item_counter=max(0, temp_item_counter),
+            dynamic_location_counter=max(0, dynamic_location_counter),
+        )
+        record.sync_after_state_update()
+
+        with self._lock:
+            self._sessions[session_id] = record
+
+        return record
+
     def get(self, session_id: str) -> SessionRecord | None:
         """Return a session record by id."""
 
@@ -210,11 +268,11 @@ class SessionStore:
         with self._lock:
             self._sessions[record.session_id] = record
 
-    def delete(self, session_id: str) -> None:
+    def delete(self, session_id: str) -> bool:
         """Remove a session if it exists."""
 
         with self._lock:
-            self._sessions.pop(session_id, None)
+            return self._sessions.pop(session_id, None) is not None
 
 
 def _build_npc_entities(
@@ -241,6 +299,20 @@ def _build_npc_entities(
             break
 
     return entities
+
+
+def _build_initial_quest_log(world_config: WorldConfig) -> dict[str, QuestState]:
+    quest_log: dict[str, QuestState] = {}
+    for index, quest_title in enumerate(world_config.initial_quests, start=1):
+        quest_id = f"quest_{index:02d}"
+        quest_log[quest_id] = QuestState(
+            quest_id=quest_id,
+            title=quest_title,
+            status="active",
+            summary=f"Opening objective tied to {world_config.starting_location}.",
+            progress=0,
+        )
+    return quest_log
 
 
 def _ensure_world_topology(world_config: WorldConfig) -> WorldConfig:
