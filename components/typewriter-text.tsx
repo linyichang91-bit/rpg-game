@@ -6,21 +6,24 @@ type TypewriterTextProps = {
   text: string;
   animate?: boolean;
   className?: string;
+  streaming?: boolean;
 };
 
 export function TypewriterText({
   text,
   animate = false,
-  className
+  className,
+  streaming = false
 }: TypewriterTextProps) {
   const deferredText = useDeferredValue(text);
-  const paragraphs = splitNarrativeParagraphs(deferredText);
+  const displayText = streaming ? text : deferredText;
+  const paragraphs = splitNarrativeParagraphs(displayText);
   const [visibleParagraphCount, setVisibleParagraphCount] = useState(
-    animate ? 0 : paragraphs.length
+    streaming || !animate ? paragraphs.length : 0
   );
 
   useEffect(() => {
-    if (!animate) {
+    if (streaming || !animate) {
       setVisibleParagraphCount(paragraphs.length);
       return;
     }
@@ -33,14 +36,17 @@ export function TypewriterText({
           window.clearInterval(timer);
           return previous;
         }
+
         return previous + 1;
       });
     }, paragraphDelayMs);
 
     return () => window.clearInterval(timer);
-  }, [animate, deferredText, paragraphs.length]);
+  }, [animate, paragraphs.length, streaming, displayText]);
 
-  const visibleParagraphs = paragraphs.slice(0, visibleParagraphCount);
+  const visibleParagraphs = streaming
+    ? paragraphs
+    : paragraphs.slice(0, visibleParagraphCount);
 
   return (
     <div className={className}>
@@ -49,7 +55,7 @@ export function TypewriterText({
           {paragraph}
         </p>
       ))}
-      {animate && visibleParagraphCount < paragraphs.length ? (
+      {(streaming || (animate && visibleParagraphCount < paragraphs.length)) ? (
         <span className="typewriter-caret" aria-hidden="true" />
       ) : null}
     </div>
@@ -70,5 +76,6 @@ function splitNarrativeParagraphs(text: string): string[] {
   if (parts.length > 0) {
     return parts;
   }
+
   return [normalized];
 }

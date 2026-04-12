@@ -11,6 +11,8 @@ from server.schemas.core import ExecutedEvent, GameState, MutationLog
 
 DEFAULT_ACTION = "loot"
 DEFAULT_BONUS_ATTRIBUTES = (
+    "stat_insight",
+    "stat_tenacity",
     "attr_perception",
     "attr_luck",
     "attr_focus",
@@ -108,23 +110,80 @@ def _resolve_loot_bonus(current_state: GameState, parameters: dict[str, Any]) ->
 
     bonus = _as_int(parameters.get("bonus"), 0)
     for attribute_key in attribute_keys:
-        if attribute_key in current_state.player.attributes:
-            bonus += _score_to_modifier(current_state.player.attributes[attribute_key])
+        resolved_score = _resolve_attribute_score(current_state.player.attributes, attribute_key)
+        if resolved_score is not None:
+            bonus += _score_to_modifier(resolved_score)
             break
 
     return bonus
 
 
 def _select_awarded_candidates(eligible_candidates: list[Any]) -> list[Any]:
-    if len(eligible_candidates) <= 2:
-        return eligible_candidates
+    """Select which eligible candidates are actually awarded.
 
-    # Reward stronger rolls with the most difficult discoveries that were still beaten.
-    return sorted(eligible_candidates, key=lambda candidate: candidate.dc, reverse=True)[:2]
+    Weighted random selection: lower-DC (more common) items have higher weight,
+    but even high-DC items can be picked.  At most 2 items are awarded; if
+    only 1 or 2 candidates are eligible, all are awarded.
+    """
+    if len(eligible_candidates) <= 2:
+        return list(eligible_candidates)
+
+    # Weight proportional to (21 - dc).  DC 1 → weight 20, DC 20 → weight 1.
+    # This makes common items more likely while still allowing rare finds.
+    weights = [max(1, 21 - c.dc) for c in eligible_candidates]
+    total_weight = sum(weights)
+
+    selected: list[Any] = []
+    remaining_indices = list(range(len(eligible_candidates)))
+    remaining_weights = list(weights)
+
+    for _ in range(2):
+        if not remaining_indices:
+            break
+        # Re-normalise weights after each pick
+        current_total = sum(remaining_weights)
+        r = random.uniform(0, current_total)
+        cumulative = 0.0
+        picked_index_in_remaining = 0
+        for i, w in enumerate(remaining_weights):
+            cumulative += w
+            if r <= cumulative:
+                picked_index_in_remaining = i
+                break
+
+        original_index = remaining_indices.pop(picked_index_in_remaining)
+        remaining_weights.pop(picked_index_in_remaining)
+        selected.append(eligible_candidates[original_index])
+
+    return selected
 
 
 def _score_to_modifier(score: int) -> int:
     return (score - 10) // 2
+
+
+def _resolve_attribute_score(attributes: dict[str, int], requested_key: str) -> int | None:
+    candidate_groups = (
+        ("stat_insight", "attr_focus", "attr_perception"),
+        ("stat_tenacity", "attr_will"),
+        ("stat_agility", "attr_dex"),
+        ("stat_power", "attr_power"),
+        ("stat_presence", "attr_presence", "charisma"),
+    )
+
+    if requested_key in attributes:
+        return attributes[requested_key]
+
+    normalized = str(requested_key).strip().lower()
+    for candidates in candidate_groups:
+        normalized_candidates = {candidate.lower() for candidate in candidates}
+        if normalized not in normalized_candidates:
+            continue
+        for candidate in candidates:
+            if candidate in attributes:
+                return attributes[candidate]
+
+    return None
 
 
 def _as_int(value: Any, default: int) -> int:

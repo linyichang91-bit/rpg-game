@@ -71,6 +71,19 @@ def _valid_world_payload() -> dict[str, Any]:
             "universe_type": "AU",
             "tone_and_style": "tense and cinematic",
         },
+        "player_character": {
+            "name": "神宫寺凛",
+            "role": "感知型见习术师",
+            "summary": "擅长感知异常与战场判断，但近身正面对抗经验不足。",
+            "objective": "赶在局势失控前找到边境异动的真正源头。",
+            "attributes": {
+                "stat_power": 9,
+                "stat_agility": 13,
+                "stat_insight": 15,
+                "stat_tenacity": 11,
+                "stat_presence": 10,
+            },
+        },
         "world_book": {
             "campaign_context": {
                 "era_and_timeline": "Konoha Team 7 early mission period",
@@ -100,6 +113,7 @@ def test_weaver_generates_world_config() -> None:
     assert config.world_id == "naruto_konoha_early"
     assert config.starting_location == "Konoha Training Ground"
     assert config.glossary.stats["stat_hp"] == "Vitality"
+    assert config.player_character.attributes["stat_insight"] == 15
 
 
 def test_world_weaver_prompt_contains_constraints() -> None:
@@ -108,6 +122,10 @@ def test_world_weaver_prompt_contains_constraints() -> None:
     assert "strictly follow the JSON schema" in prompt_bundle.system_prompt
     assert "opening_scene must be vivid and immediate" in prompt_bundle.system_prompt
     assert "world_book.campaign_context.era_and_timeline" in prompt_bundle.user_prompt
+    assert "world_book.campaign_context.main_quest" in prompt_bundle.user_prompt
+    assert "world_book.power_scaling" in prompt_bundle.user_prompt
+    assert "glossary.attributes" in prompt_bundle.user_prompt
+    assert "player_character" in prompt_bundle.user_prompt
 
 
 def test_weaver_accepts_fenced_json_payloads() -> None:
@@ -118,6 +136,21 @@ def test_weaver_accepts_fenced_json_payloads() -> None:
     config = weaver.generate_world_config("Naruto AU")
 
     assert config.world_id == "naruto_konoha_early"
+
+
+def test_weaver_retries_malformed_json_and_recovers() -> None:
+    client = FakeStructuredJSONClient(
+        [
+            "{not valid json",
+            json.dumps(_valid_world_payload()),
+        ]
+    )
+    weaver = WorldWeaver(client)
+
+    config = weaver.generate_world_config("Naruto AU")
+
+    assert config.world_id == "naruto_konoha_early"
+    assert len(client.calls) == 2
 
 
 def test_weaver_prunes_unknown_fields_before_validation() -> None:
@@ -156,9 +189,54 @@ def test_weaver_normalizes_nested_location_npc_and_quest_shapes() -> None:
     assert config.initial_quests == ["Stabilize the perimeter", "q2"]
 
 
+def test_weaver_fills_storyline_and_power_defaults_when_missing() -> None:
+    payload = _valid_world_payload()
+    payload["world_book"]["campaign_context"].pop("main_quest", None)
+    payload["world_book"]["campaign_context"].pop("current_chapter", None)
+    payload["world_book"]["campaign_context"].pop("milestones", None)
+    payload["world_book"].pop("power_scaling", None)
+    payload["glossary"].pop("attributes", None)
+    payload.pop("player_character", None)
+
+    client = FakeStructuredJSONClient([json.dumps(payload)])
+    weaver = WorldWeaver(client)
+    config = weaver.generate_world_config("Naruto AU")
+
+    campaign_context = config.world_book.campaign_context
+    assert campaign_context.main_quest.title == "主线目标"
+    assert campaign_context.current_chapter.title == "第一章"
+    assert len(campaign_context.milestones) >= 1
+    assert config.world_book.power_scaling.impossible_gap_threshold == 40
+    assert config.glossary.attributes["stat_power"] == "力量"
+    assert config.player_character.name == "未命名旅者"
+    assert config.player_character.attributes["stat_agility"] == 12
+
+
+def test_weaver_coerces_string_storyline_shapes_into_structured_models() -> None:
+    payload = _valid_world_payload()
+    payload["world_book"]["campaign_context"]["main_quest"] = "阻止边境崩盘"
+    payload["world_book"]["campaign_context"]["current_chapter"] = "先稳住训练场局势"
+    payload["world_book"]["campaign_context"]["milestones"] = [
+        "发现第一条线索",
+        {"summary": "确认入侵者接近的方向"},
+    ]
+
+    client = FakeStructuredJSONClient([json.dumps(payload, ensure_ascii=False)])
+    weaver = WorldWeaver(client)
+
+    config = weaver.generate_world_config("Naruto AU")
+    campaign_context = config.world_book.campaign_context
+
+    assert campaign_context.main_quest.title == "阻止边境崩盘"
+    assert campaign_context.current_chapter.objective == "先稳住训练场局势"
+    assert len(campaign_context.milestones) == 2
+    assert campaign_context.milestones[0].title == "发现第一条线索"
+    assert campaign_context.milestones[1].milestone_id == "milestone_02"
+
+
 def test_weaver_surfaces_validation_path_in_error_message() -> None:
     payload = _valid_world_payload()
-    del payload["world_book"]
+    del payload["fanfic_meta"]
 
     client = FakeStructuredJSONClient([json.dumps(payload)])
     weaver = WorldWeaver(client, max_validation_retries=0)
@@ -166,7 +244,26 @@ def test_weaver_surfaces_validation_path_in_error_message() -> None:
     with pytest.raises(WorldConfigValidationError) as exc_info:
         weaver.generate_world_config("Broken payload")
 
-    assert "world_book" in str(exc_info.value)
+    assert "fanfic_meta" in str(exc_info.value)
+
+
+def test_weaver_stops_after_three_total_attempts_on_repeated_validation_failures() -> None:
+    payload = _valid_world_payload()
+    del payload["fanfic_meta"]
+
+    client = FakeStructuredJSONClient(
+        [
+            json.dumps(payload),
+            json.dumps(payload),
+            json.dumps(payload),
+        ]
+    )
+    weaver = WorldWeaver(client)
+
+    with pytest.raises(WorldConfigValidationError):
+        weaver.generate_world_config("Broken payload")
+
+    assert len(client.calls) == 3
 
 
 def test_weaver_generates_world_bundle_with_long_prologue() -> None:

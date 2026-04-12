@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from server.llm.config import LLMSettings
 from server.llm.json_payload import normalize_json_payload
 from server.llm.openai_compatible import LLMGatewayError, OpenAICompatibleJSONClient
+from server.llm.retry import run_retryable_json_operation
 from server.schemas.core import EngineBaseModel, GameState, WorldNode
 
 
@@ -42,7 +43,7 @@ class DynamicMapGenerator:
         self,
         llm_client: StructuredJSONClient,
         *,
-        max_validation_retries: int = 1,
+        max_validation_retries: int = 2,
     ) -> None:
         self._llm_client = llm_client
         self._max_validation_retries = max_validation_retries
@@ -62,31 +63,57 @@ class DynamicMapGenerator:
             current_node_id=current_node_id,
             target_name=target_name,
         )
-        last_error: Exception | None = None
-
-        for _ in range(self._max_validation_retries + 1):
-            try:
-                raw_response = self._llm_client.generate_json(
-                    system_prompt=prompt_bundle.system_prompt,
-                    user_prompt=prompt_bundle.user_prompt,
-                    response_schema=prompt_bundle.response_schema,
-                )
-                payload = json.loads(normalize_json_payload(raw_response))
-                normalized = _normalize_world_node_payload(
-                    payload,
-                    node_id=target_node_id,
+        try:
+            return run_retryable_json_operation(
+                lambda: self._generate_validated_node(
+                    prompt_bundle=prompt_bundle,
+                    target_node_id=target_node_id,
                     target_name=target_name,
-                )
-                return WorldNode.model_validate(normalized)
-            except (ValidationError, json.JSONDecodeError, TypeError, ValueError, LLMGatewayError) as exc:
-                last_error = exc
+                ),
+                max_attempts=self._max_validation_retries + 1,
+                retryable_exceptions=(
+                    ValidationError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                    LLMGatewayError,
+                ),
+            )
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            LLMGatewayError,
+        ) as exc:
+            last_error = exc
 
-        return _build_fallback_node(
-            current_state=current_state,
-            target_node_id=target_node_id,
-            target_name=target_name,
-            _last_error=last_error,
+            return _build_fallback_node(
+                current_state=current_state,
+                target_node_id=target_node_id,
+                target_name=target_name,
+                _last_error=last_error,
+            )
+
+    def _generate_validated_node(
+        self,
+        *,
+        prompt_bundle: MapPromptBundle,
+        target_node_id: str,
+        target_name: str,
+    ) -> WorldNode:
+        raw_response = self._llm_client.generate_json(
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt_bundle.user_prompt,
+            response_schema=prompt_bundle.response_schema,
         )
+        payload = json.loads(normalize_json_payload(raw_response))
+        normalized = _normalize_world_node_payload(
+            payload,
+            node_id=target_node_id,
+            target_name=target_name,
+        )
+        return WorldNode.model_validate(normalized)
 
 
 def build_map_generator_from_env(*, env_file: str = ".env") -> DynamicMapGenerator:

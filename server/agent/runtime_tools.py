@@ -10,10 +10,12 @@ from typing import Any
 
 from server.generators.loot_generator import LootGenerator, build_loot_generator_from_env
 from server.generators.map_generator import DynamicMapGenerator, build_map_generator_from_env
+from server.pipelines.growth import resolve_growth
 from server.pipelines.combat import resolve_combat
 from server.pipelines.exploration import resolve_exploration
 from server.pipelines.loot import resolve_loot
 from server.runtime.session_store import SessionRecord
+from server.runtime.power_level import recalculate_power_and_rank
 from server.schemas.core import ExecutedEvent, MutationLog, WorldNode
 from server.state.mutator import apply_mutations
 
@@ -82,18 +84,26 @@ def get_runtime_tool_schemas() -> list[dict[str, Any]]:
                             "type": "string",
                             "description": "Short name of the attempted action.",
                         },
+                        "attribute_key": {
+                            "type": "string",
+                            "description": "Preferred abstract attribute key such as stat_power, stat_agility, stat_insight, stat_tenacity, or stat_presence.",
+                        },
                         "attribute_used": {
                             "type": "string",
                             "description": "Human-readable attribute label such as 体能, 敏捷, 魔力, 意志.",
                         },
+                        "proficiency_bonus": {
+                            "type": "integer",
+                            "description": "Optional proficiency bonus override. Defaults to the player's growth state.",
+                        },
                         "difficulty_class": {
                             "type": "integer",
-                            "description": "DC between 1 and 20 chosen by the GM.",
+                            "description": "DC between 1 and 40 chosen by the GM.",
                             "minimum": 1,
-                            "maximum": 20,
+                            "maximum": 40,
                         },
                     },
-                    "required": ["action_name", "attribute_used", "difficulty_class"],
+                    "required": ["action_name", "difficulty_class"],
                     "additionalProperties": False,
                 },
             },
@@ -240,6 +250,51 @@ def get_runtime_tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "trigger_growth",
+                "description": (
+                    "Trigger an explicit growth or evolution beat after a milestone, mastery spike, or epiphany."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "growth_type": {
+                            "type": "string",
+                            "enum": ["stat_boost", "new_skill", "mastery_up"],
+                            "description": "Type of evolution to apply.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Narrative reason for the growth trigger.",
+                        },
+                        "attribute_key": {
+                            "type": "string",
+                            "description": "Optional abstract attribute or skill key touched by the growth beat.",
+                        },
+                        "amount": {
+                            "type": "integer",
+                            "description": "Optional attribute boost amount.",
+                        },
+                        "skill_key": {
+                            "type": "string",
+                            "description": "Optional abstract skill key for new_skill or mastery_up.",
+                        },
+                        "skill_label": {
+                            "type": "string",
+                            "description": "Optional display label for the new or improved skill.",
+                        },
+                        "mastery_delta": {
+                            "type": "integer",
+                            "description": "Optional mastery increase amount.",
+                        },
+                    },
+                    "required": ["growth_type", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "resolve_combat_action",
                 "description": (
                     "Resolve a direct combat exchange with the deterministic combat pipeline. "
@@ -366,7 +421,36 @@ def execute_runtime_tool(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> ToolExecutionResult:
-    """Execute one registered tool against the working session record."""
+    """Execute one registered tool against the working session record.
+
+    If *arguments* contains a ``__parse_error`` key (set by the GM agent's
+    ``_parse_tool_arguments`` when JSON decoding failed), the tool is **not**
+    executed.  Instead, an explicit error result is returned so the GM can
+    react to the malformed call instead of silently running with defaults.
+    """
+
+    if "__parse_error" in arguments:
+        return ToolExecutionResult(
+            observation={
+                "status": "error",
+                "reason": "argument_parse_failed",
+                "tool_name": tool_name,
+                "parse_error": arguments["__parse_error"],
+                "raw_arguments": arguments.get("__raw", ""),
+                "detail": arguments.get("__detail", ""),
+            },
+            executed_events=[
+                ExecutedEvent(
+                    event_type="tool_error",
+                    is_success=False,
+                    actor="system",
+                    target=tool_name,
+                    abstract_action="argument_parse_failed",
+                    result_tags=["argument_parse_failed", arguments["__parse_error"]],
+                )
+            ],
+            mutation_logs=[],
+        )
 
     if tool_name == "roll_d20_check":
         return _roll_d20_check(record, arguments)
@@ -378,6 +462,8 @@ def execute_runtime_tool(
         return _update_quest_state(record, arguments)
     if tool_name == "update_encounter_state":
         return _update_encounter_state(record, arguments)
+    if tool_name == "trigger_growth":
+        return _trigger_growth(record, arguments)
     if tool_name == "resolve_combat_action":
         return _resolve_combat_action(record, arguments)
     if tool_name == "resolve_exploration_action":
@@ -410,14 +496,20 @@ def _roll_d20_check(
     arguments: dict[str, Any],
 ) -> ToolExecutionResult:
     action_name = _clean_text(arguments.get("action_name"), fallback="risk_action")
+    attribute_key = _clean_text(arguments.get("attribute_key"), fallback="")
     attribute_used = _clean_text(arguments.get("attribute_used"), fallback="generic")
-    difficulty_class = max(1, min(20, _coerce_int(arguments.get("difficulty_class"), 10)))
-    resolved_attribute, modifier = _resolve_check_modifier(record, attribute_used)
+    difficulty_class = max(1, min(40, _coerce_int(arguments.get("difficulty_class"), 10)))
+    proficiency_bonus = _coerce_optional_int(arguments.get("proficiency_bonus"))
+    if proficiency_bonus is None:
+        proficiency_bonus = record.game_state.player.growth.proficiency_bonus
+    resolved_attribute, attribute_value = _resolve_check_attribute(record, attribute_key, attribute_used)
 
     roll_result = random.randint(1, 20)
+    attribute_bonus = attribute_value / 10
+    modifier = attribute_bonus + proficiency_bonus
     total = roll_result + modifier
     critical = roll_result in {1, 20}
-    is_success = roll_result == 20 or (roll_result != 1 and total >= difficulty_class)
+    is_success = roll_result != 1 and total >= difficulty_class
 
     result_tags = [
         f"attribute:{resolved_attribute}",
@@ -426,7 +518,7 @@ def _roll_d20_check(
         f"total:{total}",
     ]
     if roll_result == 20:
-        result_tags.append("critical_success")
+        result_tags.append("critical_success" if is_success else "critical_roll")
     elif roll_result == 1:
         result_tags.append("critical_failure")
     else:
@@ -436,6 +528,9 @@ def _roll_d20_check(
         observation={
             "roll_result": roll_result,
             "modifier": modifier,
+            "attribute_value": attribute_value,
+            "attribute_bonus": attribute_bonus,
+            "proficiency_bonus": proficiency_bonus,
             "total": total,
             "difficulty_class": difficulty_class,
             "is_success": is_success,
@@ -785,11 +880,18 @@ def _update_quest_state(
 
     _apply_logs(record, logs)
     quest_state = record.game_state.quest_log[quest_id]
+    storyline_logs = _sync_storyline_progress_from_quest(record, quest_state)
+    if storyline_logs:
+        logs.extend(storyline_logs)
+        _apply_logs(record, storyline_logs)
+        quest_state = record.game_state.quest_log[quest_id]
     result_tags = [f"quest_status:{quest_state.status}"]
     if progress is not None:
         result_tags.append("quest_progress_set")
     elif progress_delta != 0:
         result_tags.append(f"quest_progress_delta:{progress_delta}")
+    if storyline_logs:
+        result_tags.append("chapter_progress_synced")
 
     return ToolExecutionResult(
         observation={
@@ -799,6 +901,7 @@ def _update_quest_state(
             "quest_status": quest_state.status,
             "progress": quest_state.progress,
             "summary": quest_state.summary,
+            "chapter_progress_percent": record.game_state.world_config.world_book.campaign_context.current_chapter.progress_percent,
         },
         executed_events=[
             ExecutedEvent(
@@ -811,6 +914,82 @@ def _update_quest_state(
             )
         ],
         mutation_logs=logs,
+    )
+
+
+def _sync_storyline_progress_from_quest(
+    record: SessionRecord,
+    quest_state,
+) -> list[MutationLog]:
+    campaign_context = record.game_state.world_config.world_book.campaign_context
+    current_chapter = campaign_context.current_chapter
+    if (
+        current_chapter.linked_quest_id != quest_state.quest_id
+        and campaign_context.main_quest.linked_quest_id != quest_state.quest_id
+    ):
+        return []
+
+    if quest_state.status == "completed":
+        next_progress = 100
+    else:
+        next_progress = min(99, max(current_chapter.progress_percent, quest_state.progress * 10))
+
+    logs: list[MutationLog] = []
+    if next_progress != current_chapter.progress_percent:
+        logs.append(
+            MutationLog(
+                action="set",
+                target_path="world_config.world_book.campaign_context.current_chapter.progress_percent",
+                value=next_progress,
+                reason="chapter_progress_update",
+            )
+        )
+
+    main_quest = campaign_context.main_quest
+    if main_quest.linked_quest_id == quest_state.quest_id and next_progress != main_quest.progress_percent:
+        logs.append(
+            MutationLog(
+                action="set",
+                target_path="world_config.world_book.campaign_context.main_quest.progress_percent",
+                value=next_progress,
+                reason="main_quest_progress_update",
+            )
+        )
+
+    if quest_state.status == "completed":
+        for index, milestone in enumerate(campaign_context.milestones):
+            if milestone.is_completed:
+                continue
+            updated_milestones = [
+                existing.model_copy(deep=True) if hasattr(existing, "model_copy") else existing
+                for existing in campaign_context.milestones
+            ]
+            updated_milestones[index].is_completed = True
+            logs.append(
+                MutationLog(
+                    action="set",
+                    target_path="world_config.world_book.campaign_context.milestones",
+                    value=updated_milestones,
+                    reason="story_milestone_completed",
+                )
+            )
+            break
+
+    return logs
+
+
+def _trigger_growth(
+    record: SessionRecord,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    resolution = resolve_growth(record.game_state, arguments)
+    if resolution.mutation_logs:
+        _apply_logs(record, resolution.mutation_logs)
+
+    return ToolExecutionResult(
+        observation=resolution.observation,
+        executed_events=[resolution.executed_event],
+        mutation_logs=resolution.mutation_logs,
     )
 
 
@@ -1090,6 +1269,7 @@ def _apply_logs(record: SessionRecord, logs: list[MutationLog]) -> None:
         return
     record.game_state = apply_mutations(record.game_state, logs)
     record.sync_after_state_update()
+    _sync_power_level(record)
 
 
 def _queue_stat_update(
@@ -1423,72 +1603,82 @@ def _canonicalize_quest_id(quest_id: str) -> str:
     return f"quest_{int(numeric_suffix):02d}"
 
 
-def _resolve_check_modifier(record: SessionRecord, attribute_used: str) -> tuple[str, int]:
-    normalized = _normalize(attribute_used)
+def _resolve_check_attribute(
+    record: SessionRecord,
+    attribute_key: str,
+    attribute_used: str,
+) -> tuple[str, int]:
     player_attributes = record.game_state.player.attributes
-
-    if attribute_used in player_attributes:
-        return attribute_used, _score_to_modifier(player_attributes[attribute_used])
+    glossary = record.game_state.world_config.glossary.attributes
 
     alias_groups = (
         (
-            "attr_power",
-            {
-                "\u4f53\u80fd",
-                "\u529b\u91cf",
-                "\u529b\u6c14",
-                "\u7206\u53d1",
-                "\u8fd1\u6218",
-                "power",
-                "strength",
-            },
+            "stat_power",
+            ("attr_power", "power", "strength", "force", "power"),
         ),
         (
-            "attr_dex",
-            {
-                "\u654f\u6377",
-                "\u901f\u5ea6",
-                "\u95ea\u907f",
-                "\u7075\u5de7",
-                "\u53cd\u5e94",
-                "dex",
-                "dexterity",
-            },
+            "stat_agility",
+            ("attr_dex", "attr_agility", "dex", "dexterity", "speed", "agility"),
         ),
         (
-            "attr_will",
-            {
-                "\u9b54\u529b",
-                "\u6cd5\u529b",
-                "\u5492\u529b",
-                "\u7cbe\u795e",
-                "\u610f\u5fd7",
-                "will",
-                "mana",
-            },
+            "stat_insight",
+            ("attr_focus", "focus", "perception", "insight", "awareness"),
         ),
         (
-            "attr_focus",
-            {
-                "\u611f\u77e5",
-                "\u89c2\u5bdf",
-                "\u4e13\u6ce8",
-                "\u6d1e\u5bdf",
-                "focus",
-                "perception",
-            },
+            "stat_tenacity",
+            ("attr_will", "will", "mana", "tenacity", "spirit", "resolve"),
+        ),
+        (
+            "stat_presence",
+            ("attr_presence", "presence", "charisma", "leadership", "charm"),
         ),
     )
 
-    for attribute_key, aliases in alias_groups:
-        if attribute_key in player_attributes and (
-            normalized == _normalize(attribute_key)
-            or normalized in {_normalize(alias) for alias in aliases}
-        ):
-            return attribute_key, _score_to_modifier(player_attributes[attribute_key])
+    normalized_lookup = {
+        _normalize(key): key for key in player_attributes
+    }
+    normalized_lookup.update({_normalize(label): key for key, label in glossary.items()})
 
-    if "attr_dex" in player_attributes:
-        return "attr_dex", _score_to_modifier(player_attributes["attr_dex"])
+    def _match_candidate(candidate: str) -> tuple[str, int] | None:
+        if not candidate:
+            return None
+        if candidate in player_attributes:
+            return candidate, player_attributes[candidate]
+        normalized_candidate = _normalize(candidate)
+        if normalized_candidate in normalized_lookup:
+            resolved_key = normalized_lookup[normalized_candidate]
+            return resolved_key, player_attributes.get(resolved_key, 0)
+        for canonical_key, aliases in alias_groups:
+            if candidate == canonical_key or normalized_candidate == _normalize(canonical_key):
+                if canonical_key in player_attributes:
+                    return canonical_key, player_attributes[canonical_key]
+                for alias in aliases:
+                    if alias in player_attributes:
+                        return alias, player_attributes[alias]
+                break
+            if normalized_candidate in {_normalize(alias) for alias in aliases}:
+                if canonical_key in player_attributes:
+                    return canonical_key, player_attributes[canonical_key]
+                for alias in aliases:
+                    if alias in player_attributes:
+                        return alias, player_attributes[alias]
+        return None
+
+    for candidate in (attribute_key, attribute_used):
+        resolved = _match_candidate(candidate)
+        if resolved is not None:
+            return resolved
+
+    for canonical_key, aliases in alias_groups:
+        if canonical_key in player_attributes:
+            return canonical_key, player_attributes[canonical_key]
+        for alias in aliases:
+            if alias in player_attributes:
+                return alias, player_attributes[alias]
+
+    if player_attributes:
+        fallback_key = next(iter(player_attributes))
+        return fallback_key, player_attributes[fallback_key]
     return "flat", 0
 
 
@@ -1616,3 +1806,14 @@ def _normalize_for_match(value: str) -> str:
 
 def _score_to_modifier(score: int) -> int:
     return (score - 10) // 2
+
+
+def _sync_power_level(record: SessionRecord) -> None:
+    """Recalculate power_level and rank_label after any state mutation."""
+    try:
+        power_level, rank_label = recalculate_power_and_rank(record.game_state)
+        record.game_state.player.power_level = power_level
+        record.game_state.player.rank_label = rank_label
+    except Exception:
+        # Never let power level recalc break the main flow.
+        pass

@@ -85,16 +85,72 @@ def build_world_config() -> WorldConfig:
             universe_type="同人",
             tone_and_style="紧张、凌厉、沉浸",
         ),
+        player_character={
+            "name": "神宫寺凛",
+            "role": "感知型见习术师",
+            "summary": "擅长判断战场变化，正面爆发力一般，但反应和洞察都很强。",
+            "objective": "查出涩谷异常背后的推手，并尽量救下更多人。",
+            "attributes": {
+                "stat_power": 10,
+                "stat_agility": 12,
+                "stat_insight": 14,
+                "stat_tenacity": 12,
+                "stat_presence": 10,
+            },
+        },
         world_book={
             "campaign_context": {
                 "era_and_timeline": "东京现代咒术时代",
                 "macro_world_state": "咒灵在城市阴影中活跃，术师组织维持着脆弱秩序。",
                 "looming_crisis": "涩谷方向的异常波动正在抬升，任何拖延都可能酿成更大伤亡。",
                 "opening_scene": "你在废弃站台边缘喘息，远处的咒灵正沿着铁轨逼近。",
+                "main_quest": {
+                    "quest_id": "quest_main",
+                    "title": "封锁涩谷波动",
+                    "final_goal": "在事态失控前阻止更大的灾变。",
+                    "summary": "主线围绕涩谷异常展开。",
+                    "linked_quest_id": "quest_01",
+                },
+                "current_chapter": {
+                    "chapter_id": "chapter_01",
+                    "title": "站台开局",
+                    "objective": "在站台边缘稳住局势并确认威胁来源。",
+                    "tension_level": 4,
+                    "progress_percent": 0,
+                    "linked_quest_id": "quest_01",
+                },
+                "milestones": [
+                    {
+                        "milestone_id": "milestone_01",
+                        "title": "抵达站台",
+                        "summary": "确认现场态势。",
+                        "is_completed": False,
+                    }
+                ],
+            },
+            "power_scaling": {
+                "scale_label": "jujutsu_power_curve",
+                "danger_gap_threshold": 20,
+                "impossible_gap_threshold": 40,
+                "benchmark_examples": [
+                    {
+                        "subject": "普通咒灵",
+                        "offense_rating": 10,
+                        "defense_rating": 10,
+                        "notes": "日常低危。",
+                    }
+                ],
             }
         },
         glossary=WorldGlossary(
             stats={"stat_hp": "生命值", "stat_mp": "咒力"},
+            attributes={
+                "stat_power": "咒力输出",
+                "stat_agility": "身法",
+                "stat_insight": "洞察",
+                "stat_tenacity": "韧性",
+                "stat_presence": "气场",
+            },
             damage_types={"dmg_kinetic": "冲击"},
             item_categories={"item_weapon": "武器"},
         ),
@@ -119,6 +175,13 @@ def _make_long_narration(seed: str) -> str:
     )
     return f"{seed}\n\n" + (fragment * 10)
 
+
+async def _collect_stream_updates(stream) -> list:
+    updates = []
+    async for update in stream:
+        updates.append(update)
+    return updates
+
 def test_session_creation_seeds_runtime_quest_and_encounter_logs() -> None:
     record = _build_record()
 
@@ -126,6 +189,20 @@ def test_session_creation_seeds_runtime_quest_and_encounter_logs() -> None:
     assert record.game_state.quest_log["quest_01"].status == "active"
     assert "encounter_opening" in record.game_state.encounter_log
     assert record.game_state.encounter_log["encounter_opening"].status == "active"
+    assert set(record.game_state.player.attributes) == {
+        "stat_power",
+        "stat_agility",
+        "stat_insight",
+        "stat_tenacity",
+        "stat_presence",
+    }
+    assert record.game_state.player.attributes["stat_insight"] == 14
+    assert record.game_state.player.growth.level == 1
+    assert record.game_state.player.growth.proficiency_bonus == 2
+    assert (
+        record.game_state.world_config.world_book.campaign_context.current_chapter.linked_quest_id
+        == "quest_01"
+    )
 
 
 def test_gm_agent_resolves_compound_turn_with_multiple_tool_calls(monkeypatch) -> None:
@@ -222,10 +299,73 @@ def test_gm_agent_resolves_compound_turn_with_multiple_tool_calls(monkeypatch) -
         "modify_game_state",
         "inventory_manager",
         "update_encounter_state",
+        "trigger_growth",
         "resolve_combat_action",
         "resolve_exploration_action",
         "resolve_loot_action",
     }.issubset(set(tool_names))
+
+
+def test_roll_d20_check_uses_new_attribute_formula_and_rejects_nat20_auto_success(monkeypatch) -> None:
+    record = _build_record()
+    record.game_state.player.attributes["stat_power"] = 20
+    monkeypatch.setattr("server.agent.runtime_tools.random.randint", lambda _low, _high: 20)
+
+    result = execute_runtime_tool(
+        record,
+        "roll_d20_check",
+        {
+            "action_name": "猛烈一击",
+            "attribute_key": "stat_power",
+            "difficulty_class": 30,
+        },
+    )
+
+    assert result.observation["resolved_attribute"] == "stat_power"
+    assert result.observation["proficiency_bonus"] == 2
+    assert result.observation["total"] == 24.0
+    assert result.observation["is_success"] is False
+    assert result.executed_events[0].is_success is False
+
+
+def test_roll_d20_check_accepts_legacy_attribute_used_label(monkeypatch) -> None:
+    record = _build_record()
+    record.game_state.player.attributes["attr_dex"] = 10
+    monkeypatch.setattr("server.agent.runtime_tools.random.randint", lambda _low, _high: 10)
+
+    result = execute_runtime_tool(
+        record,
+        "roll_d20_check",
+        {
+            "action_name": "灵巧闪避",
+            "attribute_used": "attr_dex",
+            "difficulty_class": 12,
+        },
+    )
+
+    assert result.observation["resolved_attribute"] == "attr_dex"
+    assert result.observation["total"] == 13.0
+    assert result.observation["is_success"] is True
+
+
+def test_trigger_growth_updates_player_attributes_and_growth_state() -> None:
+    record = _build_record()
+
+    result = execute_runtime_tool(
+        record,
+        "trigger_growth",
+        {
+            "growth_type": "stat_boost",
+            "reason": "觉醒黑闪余波",
+            "attribute_key": "stat_power",
+            "amount": 3,
+        },
+    )
+
+    assert result.executed_events[0].event_type == "growth"
+    assert record.game_state.player.attributes["stat_power"] == 13
+    assert record.game_state.player.growth.xp == 25
+    assert record.game_state.player.growth.last_growth_reason == "觉醒黑闪余波"
 
 def test_gm_agent_can_finish_a_turn_with_specialized_combat_tool(monkeypatch) -> None:
     record = _build_record()
@@ -272,6 +412,57 @@ def test_gm_agent_can_finish_a_turn_with_specialized_combat_tool(monkeypatch) ->
     assert "你猛地贴近" in result.narration
     assert any(event.event_type == "combat" for event in result.executed_events)
     assert record.game_state.encounter_entities["enemy_01"].stats["stat_hp"] < 16
+
+
+def test_gm_agent_stream_turn_emits_status_delta_and_result(monkeypatch) -> None:
+    record = _build_record()
+    client = FakeToolCallingClient(
+        [
+            {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "name": "modify_game_state",
+                        "arguments": json.dumps(
+                            {
+                                "target_entity": "player",
+                                "mp_delta": -2,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+            {
+                "content": _make_long_narration(
+                    "你压低呼吸，任由热浪擦过脸侧，再在刹那间逼出一道护势，把摇晃的局面重新稳住。"
+                ),
+                "tool_calls": [],
+            },
+        ]
+    )
+    agent = GameMasterAgent(client)
+
+    updates = asyncio.run(
+        _collect_stream_updates(
+            agent.stream_turn(
+                record=record,
+                user_input="我先稳住阵脚，再消耗咒力展开防护。",
+            )
+        )
+    )
+
+    assert updates[0].kind == "status"
+    assert updates[0].phase == "resolving_tools"
+    assert any(update.kind == "narration_start" for update in updates)
+    assert any(update.kind == "narration_end" for update in updates)
+    deltas = [update.delta for update in updates if update.kind == "narration_delta"]
+    assert "".join(delta for delta in deltas if delta) == updates[-2].narration
+    assert updates[-1].kind == "result"
+    assert updates[-1].source_record is not None
+    assert updates[-1].source_record.game_state.player.stats["stat_mp"] == 10
+    assert record.game_state.player.stats["stat_mp"] == 12
 
 def test_resolve_combat_action_uses_pipeline_and_registers_loot(monkeypatch) -> None:
     record = _build_record()
@@ -373,6 +564,10 @@ def test_update_quest_state_advances_existing_runtime_quest() -> None:
     assert result.executed_events[0].event_type == "quest"
     assert record.game_state.quest_log["quest_01"].status == "completed"
     assert record.game_state.quest_log["quest_01"].progress == 1
+    assert (
+        record.game_state.world_config.world_book.campaign_context.current_chapter.progress_percent
+        == 100
+    )
 
 
 def test_update_quest_state_accepts_zero_padded_quest_id() -> None:

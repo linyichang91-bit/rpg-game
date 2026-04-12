@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 from functools import lru_cache
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from server.agent.gm import build_gm_agent_from_env
+from server.agent.runtime_tools import commit_session_record
 from server.generators.loot_generator import LootGenerator, build_loot_generator_from_env
 from server.initialization.weaver import WorldWeaverError, generate_world_bundle
 from server.llm.openai_compatible import LLMGatewayError
@@ -54,6 +60,7 @@ class GameStartRequest(BaseModel):
 class GameActionRequest(BaseModel):
     session_id: str
     user_input: str = Field(..., min_length=1)
+    client_turn_id: str | None = None
 
 
 class SaveLootTarget(BaseModel):
@@ -110,6 +117,7 @@ class GameResetResponse(BaseModel):
 
 
 app = FastAPI(title="Fanfic Sandbox API")
+logger = logging.getLogger("uvicorn.error")
 
 
 @lru_cache(maxsize=1)
@@ -135,12 +143,27 @@ def healthcheck() -> dict[str, str]:
 @app.post("/api/world/generate", response_model=WorldGenerateResponse)
 def world_generate(request: WorldGenerateRequest) -> WorldGenerateResponse:
     started_at = perf_counter()
+    logger.info(
+        "API /api/world/generate started: prompt_chars=%s prompt_preview=%s",
+        len(request.prompt),
+        _log_preview(request.prompt),
+    )
     try:
         weave_result = generate_world_bundle(request.prompt)
     except (WorldWeaverError, LLMGatewayError) as exc:
+        logger.exception(
+            "API /api/world/generate failed: prompt_preview=%s",
+            _log_preview(request.prompt),
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     duration_ms = round((perf_counter() - started_at) * 1000)
+    logger.info(
+        "API /api/world/generate finished: duration_ms=%s world_id=%s theme=%s",
+        duration_ms,
+        weave_result.world_config.world_id,
+        weave_result.world_config.theme,
+    )
     return WorldGenerateResponse(
         world_config=weave_result.world_config,
         prologue_text=weave_result.prologue_text,
@@ -251,6 +274,197 @@ async def game_action(request: GameActionRequest) -> GameTurnResponse:
     )
 
 
+@app.post("/api/game/action/stream")
+async def game_action_stream(request: GameActionRequest) -> StreamingResponse:
+    session_store = get_session_store()
+    gm_engine = get_gm_engine()
+
+    record = session_store.get(request.session_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired.")
+
+    client_turn_id = request.client_turn_id or f"turn_{uuid4().hex[:12]}"
+    server_turn_id = f"turnsrv_{uuid4().hex[:12]}"
+    message_id = f"msg_{uuid4().hex[:12]}"
+
+    async def event_stream():
+        yield _format_sse_event(
+            "turn.accepted",
+            {
+                "type": "turn.accepted",
+                "session_id": record.session_id,
+                "client_turn_id": client_turn_id,
+                "server_turn_id": server_turn_id,
+                "accepted_at": int(time() * 1000),
+            },
+        )
+        yield _format_sse_event(
+            "turn.status",
+            {
+                "type": "turn.status",
+                "session_id": record.session_id,
+                "client_turn_id": client_turn_id,
+                "server_turn_id": server_turn_id,
+                "phase": "loading_session",
+                "message": "会话已载入，正在准备结算。",
+                "progress": 0,
+            },
+        )
+
+        chunk_index = 0
+        try:
+            async with asyncio.timeout(120):
+                async for update in gm_engine.stream_turn(
+                    record=record,
+                    user_input=request.user_input,
+                ):
+                    if update.kind == "status":
+                        yield _format_sse_event(
+                            "turn.status",
+                            {
+                                "type": "turn.status",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "phase": update.phase,
+                                "message": update.message,
+                                "progress": None,
+                            },
+                        )
+                        continue
+
+                    if update.kind == "narration_start":
+                        yield _format_sse_event(
+                            "narration.start",
+                            {
+                                "type": "narration.start",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "message_id": message_id,
+                                "role": "system",
+                            },
+                        )
+                        continue
+
+                    if update.kind == "narration_delta" and update.delta:
+                        yield _format_sse_event(
+                            "narration.delta",
+                            {
+                                "type": "narration.delta",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "message_id": message_id,
+                                "delta": update.delta,
+                                "chunk_index": chunk_index,
+                            },
+                        )
+                        chunk_index += 1
+                        continue
+
+                    if update.kind == "narration_end":
+                        yield _format_sse_event(
+                            "narration.end",
+                            {
+                                "type": "narration.end",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "message_id": message_id,
+                                "full_text": update.narration or "",
+                            },
+                        )
+                        continue
+
+                    if (
+                        update.kind == "result"
+                        and update.result is not None
+                        and update.source_record is not None
+                    ):
+                        yield _format_sse_event(
+                            "turn.status",
+                            {
+                                "type": "turn.status",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "phase": "finalizing_state",
+                                "message": "正在写入本回合结果。",
+                                "progress": None,
+                            },
+                        )
+                        commit_session_record(update.source_record, record)
+                        _remember_visible_text(record, update.result.narration)
+                        session_store.save(record)
+                        yield _format_sse_event(
+                            "turn.completed",
+                            {
+                                "type": "turn.completed",
+                                "session_id": record.session_id,
+                                "client_turn_id": client_turn_id,
+                                "server_turn_id": server_turn_id,
+                                "narration": update.result.narration,
+                                "current_state": record.game_state.model_dump(mode="json"),
+                                "executed_events": [
+                                    event.model_dump(mode="json")
+                                    for event in update.result.executed_events
+                                ],
+                                "mutation_logs": [
+                                    log.model_dump(mode="json")
+                                    for log in update.result.mutation_logs
+                                ],
+                                "telemetry": None,
+                            },
+                        )
+                        return
+        except (LLMGatewayError, asyncio.TimeoutError) as exc:
+            exc_type = "llm_gateway_error" if isinstance(exc, LLMGatewayError) else "turn_timeout"
+            exc_message = (
+                str(exc) if isinstance(exc, LLMGatewayError)
+                else "回合生成超时（120秒），请重试。"
+            )
+            exc_retryable = True
+            yield _format_sse_event(
+                "turn.error",
+                {
+                    "type": "turn.error",
+                    "session_id": record.session_id,
+                    "client_turn_id": client_turn_id,
+                    "server_turn_id": server_turn_id,
+                    "code": exc_type,
+                    "message": exc_message,
+                    "retryable": exc_retryable,
+                },
+            )
+            return
+        except Exception as exc:
+            yield _format_sse_event(
+                "turn.error",
+                {
+                    "type": "turn.error",
+                    "session_id": record.session_id,
+                    "client_turn_id": client_turn_id,
+                    "server_turn_id": server_turn_id,
+                    "code": "internal_error",
+                    "message": str(exc),
+                    "retryable": False,
+                },
+            )
+            return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+        background=None,
+    )
+
+
 @app.post("/api/game/save", response_model=GameSaveResponse)
 def game_save(request: GameSaveRequest) -> GameSaveResponse:
     session_store = get_session_store()
@@ -297,6 +511,13 @@ def _remember_visible_text(record: SessionRecord, text: str | None) -> None:
         record.recent_visible_text = None
 
 
+def _format_sse_event(event_name: str, payload: dict[str, Any]) -> bytes:
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+
 def _build_runtime_snapshot(record: SessionRecord) -> RuntimeSessionSnapshot:
     return RuntimeSessionSnapshot(
         recent_visible_text=record.recent_visible_text,
@@ -315,6 +536,13 @@ def _build_runtime_snapshot(record: SessionRecord) -> RuntimeSessionSnapshot:
         temp_item_counter=record.temp_item_counter,
         dynamic_location_counter=record.dynamic_location_counter,
     )
+
+
+def _log_preview(value: Any, *, limit: int = 240) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
 
 
 def _resolve_loot_turn(

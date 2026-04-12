@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
+from fastapi.testclient import TestClient
 from server.api.app import (
     GameResetRequest,
     GameRestoreRequest,
@@ -11,11 +13,13 @@ from server.api.app import (
     GameStartRequest,
     RuntimeSessionSnapshot,
     SaveLootTarget,
+    app,
     game_reset,
     game_restore,
     game_save,
     game_start,
 )
+from server.agent.gm import AgentTurnResult, AgentTurnStreamUpdate
 from server.runtime.session_store import LootTarget, SessionStore
 from server.schemas.core import FanficMetaData, WorldConfig, WorldGlossary
 
@@ -46,6 +50,23 @@ def build_world_config() -> WorldConfig:
         key_npcs=["辅助监督", "巡逻咒灵"],
         initial_quests=["活着离开站台区"],
     )
+
+
+def _parse_sse_body(body: str) -> list[tuple[str, dict[str, object]]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    for block in body.strip().split("\n\n"):
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ").strip()
+            elif line.startswith("data: "):
+                data_lines.append(line.removeprefix("data: "))
+
+        if event_name and data_lines:
+            events.append((event_name, json.loads("".join(data_lines))))
+
+    return events
 
 
 def test_game_start_reuses_prebuilt_prologue(monkeypatch) -> None:
@@ -110,6 +131,83 @@ def test_game_start_falls_back_to_gm_opening_when_prologue_missing(monkeypatch) 
     assert gm.calls == 1
     assert response.telemetry is not None
     assert response.telemetry.stages[1].stage_id == "opening_scene"
+
+
+def test_game_action_stream_emits_sse_events_and_commits_state(monkeypatch) -> None:
+    store = SessionStore()
+    record = store.create_session(build_world_config(), world_prompt="咒术回战同人")
+
+    class FakeStreamingGM:
+        async def stream_turn(self, *, record, user_input: str):
+            del user_input
+            working_record = record.model_copy(deep=True) if hasattr(record, "model_copy") else record
+            if working_record is record:
+                from copy import deepcopy
+
+                working_record = deepcopy(record)
+            working_record.game_state.player.stats["stat_mp"] = 9
+            narration = "风压沿着铁轨压来，你稳住脚下，咒力在指节间一点点凝结成形。"
+
+            yield AgentTurnStreamUpdate(
+                kind="status",
+                phase="resolving_tools",
+                message="Resolving tools and validating world-state changes.",
+            )
+            yield AgentTurnStreamUpdate(kind="narration_start")
+            yield AgentTurnStreamUpdate(kind="narration_delta", delta="风压沿着铁轨压来，")
+            yield AgentTurnStreamUpdate(kind="narration_delta", delta="你稳住脚下，咒力在指节间一点点凝结成形。")
+            yield AgentTurnStreamUpdate(kind="narration_end", narration=narration)
+            yield AgentTurnStreamUpdate(
+                kind="result",
+                result=AgentTurnResult(
+                    narration=narration,
+                    executed_events=[],
+                    mutation_logs=[],
+                ),
+                source_record=working_record,
+            )
+
+    monkeypatch.setattr("server.api.app.get_session_store", lambda: store)
+    monkeypatch.setattr("server.api.app.get_gm_engine", lambda: FakeStreamingGM())
+
+    client = TestClient(app)
+    with client.stream(
+        "POST",
+        "/api/game/action/stream",
+        json={
+            "session_id": record.session_id,
+            "user_input": "我稳住呼吸，展开防御。",
+            "client_turn_id": "client_turn_01",
+        },
+    ) as response:
+        body = b"".join(response.iter_raw()).decode("utf-8")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse_body(body)
+    event_names = [name for name, _payload in events]
+    assert event_names == [
+        "turn.accepted",
+        "turn.status",
+        "turn.status",
+        "narration.start",
+        "narration.delta",
+        "narration.delta",
+        "narration.end",
+        "turn.status",
+        "turn.completed",
+    ]
+
+    completed_payload = events[-1][1]
+    assert completed_payload["type"] == "turn.completed"
+    assert completed_payload["client_turn_id"] == "client_turn_01"
+    assert completed_payload["narration"].startswith("风压沿着铁轨压来")
+
+    saved_record = store.get(record.session_id)
+    assert saved_record is not None
+    assert saved_record.game_state.player.stats["stat_mp"] == 9
+    assert saved_record.recent_visible_text == completed_payload["narration"]
 
 
 def test_game_save_exports_runtime_snapshot(monkeypatch) -> None:

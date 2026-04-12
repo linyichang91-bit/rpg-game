@@ -12,6 +12,7 @@ from pydantic import Field, ValidationError, field_validator
 from server.llm.config import LLMSettings
 from server.llm.json_payload import normalize_json_payload
 from server.llm.openai_compatible import OpenAICompatibleJSONClient
+from server.llm.retry import run_retryable_json_operation
 from server.schemas.core import ABSTRACT_KEY_PATTERN, EngineBaseModel, WorldConfig
 
 
@@ -77,7 +78,7 @@ class LootGenerator:
         self,
         llm_client: StructuredJSONClient,
         *,
-        max_validation_retries: int = 1,
+        max_validation_retries: int = 2,
     ) -> None:
         self._llm_client = llm_client
         self._max_validation_retries = max_validation_retries
@@ -97,31 +98,49 @@ class LootGenerator:
             target_name=target_name,
             user_input=user_input,
         )
-        last_error: Exception | None = None
-
-        for _ in range(self._max_validation_retries + 1):
-            try:
-                raw_response = self._llm_client.generate_json(
-                    system_prompt=prompt_bundle.system_prompt,
-                    user_prompt=prompt_bundle.user_prompt,
-                    response_schema=prompt_bundle.response_schema,
-                )
-                normalized_payload = _normalize_loot_payload(
-                    json.loads(normalize_json_payload(raw_response)),
+        try:
+            return run_retryable_json_operation(
+                lambda: self._generate_validated_pool(
+                    prompt_bundle=prompt_bundle,
                     temp_key_factory=temp_key_factory,
-                )
-                loot_pool = LootPool.model_validate(normalized_payload)
-                if loot_pool.candidates:
-                    return loot_pool
-            except (ValidationError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                last_error = exc
+                ),
+                max_attempts=self._max_validation_retries + 1,
+                retryable_exceptions=(
+                    ValidationError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ),
+            )
+        except (ValidationError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            last_error = exc
 
-        return _build_fallback_loot_pool(
-            world_config=world_config,
-            target_name=target_name,
-            temp_key_factory=temp_key_factory,
-            _last_error=last_error,
+            return _build_fallback_loot_pool(
+                world_config=world_config,
+                target_name=target_name,
+                temp_key_factory=temp_key_factory,
+                _last_error=last_error,
+            )
+
+    def _generate_validated_pool(
+        self,
+        *,
+        prompt_bundle: LootPromptBundle,
+        temp_key_factory: TempKeyFactory,
+    ) -> LootPool:
+        raw_response = self._llm_client.generate_json(
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt_bundle.user_prompt,
+            response_schema=prompt_bundle.response_schema,
         )
+        normalized_payload = _normalize_loot_payload(
+            json.loads(normalize_json_payload(raw_response)),
+            temp_key_factory=temp_key_factory,
+        )
+        loot_pool = LootPool.model_validate(normalized_payload)
+        if not loot_pool.candidates:
+            raise ValueError("Loot payload did not contain any usable candidates.")
+        return loot_pool
 
 
 def build_loot_generator_from_env(*, env_file: str = ".env") -> LootGenerator:

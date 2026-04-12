@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from textwrap import dedent
 from typing import Any, Protocol, get_args, get_origin
 
@@ -11,7 +13,20 @@ from pydantic import BaseModel, ValidationError
 from server.llm.config import LLMSettings
 from server.llm.json_payload import normalize_json_payload
 from server.llm.openai_compatible import OpenAICompatibleJSONClient
+from server.llm.retry import run_retryable_json_operation
 from server.schemas.core import EngineBaseModel, WorldConfig
+
+
+DEFAULT_PLAYER_CHARACTER_ATTRIBUTES = {
+    "stat_power": 10,
+    "stat_agility": 12,
+    "stat_insight": 10,
+    "stat_tenacity": 12,
+    "stat_presence": 10,
+}
+
+ABSTRACT_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+logger = logging.getLogger("uvicorn.error")
 
 
 class WorldWeaverPromptBundle(EngineBaseModel):
@@ -78,7 +93,7 @@ class WorldWeaver:
         llm_client: StructuredJSONClient,
         *,
         narrative_client: NarrativeTextClient | None = None,
-        max_validation_retries: int = 1,
+        max_validation_retries: int = 2,
     ) -> None:
         self._llm_client = llm_client
         self._narrative_client = narrative_client
@@ -88,28 +103,83 @@ class WorldWeaver:
         """Generate and validate a WorldConfig from a fanfiction setup prompt."""
 
         prompt_bundle = build_world_weaver_prompt(fanfic_prompt)
-        last_error: Exception | None = None
-
-        for _ in range(self._max_validation_retries + 1):
-            raw_response = self._llm_client.generate_json(
-                system_prompt=prompt_bundle.system_prompt,
-                user_prompt=prompt_bundle.user_prompt,
-                response_schema=prompt_bundle.response_schema,
+        try:
+            return run_retryable_json_operation(
+                lambda: self._generate_validated_world_config(prompt_bundle),
+                max_attempts=self._max_validation_retries + 1,
+                retryable_exceptions=(
+                    ValidationError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ),
             )
-            try:
-                normalized_response = normalize_json_payload(raw_response)
-                normalized_payload = _normalize_world_config_payload(
-                    json.loads(normalized_response)
-                )
-                return WorldConfig.model_validate(normalized_payload)
-            except ValidationError as exc:
-                last_error = exc
-            except json.JSONDecodeError as exc:
-                last_error = exc
+        except (ValidationError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            last_error = exc
+            logger.warning(
+                "WorldWeaver validation failed after retries: %s",
+                _build_world_config_validation_error_message(last_error),
+            )
+            raise WorldConfigValidationError(
+                _build_world_config_validation_error_message(last_error)
+            ) from last_error
 
-        raise WorldConfigValidationError(
-            _build_world_config_validation_error_message(last_error)
-        ) from last_error
+    def _generate_validated_world_config(
+        self,
+        prompt_bundle: WorldWeaverPromptBundle,
+    ) -> WorldConfig:
+        logger.info(
+            "WorldWeaver attempt started: prompt_chars=%s",
+            len(prompt_bundle.user_prompt),
+        )
+        raw_response = self._llm_client.generate_json(
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt_bundle.user_prompt,
+            response_schema=prompt_bundle.response_schema,
+        )
+        logger.info(
+            "WorldWeaver raw response received: chars=%s preview=%s",
+            len(raw_response),
+            _log_preview(raw_response),
+        )
+        normalized_response = normalize_json_payload(raw_response)
+        parsed_payload = json.loads(normalized_response)
+        if isinstance(parsed_payload, dict):
+            world_book_payload = parsed_payload.get("world_book", {})
+            campaign_context = (
+                world_book_payload.get("campaign_context", {})
+                if isinstance(world_book_payload, dict)
+                else {}
+            )
+            if isinstance(campaign_context, dict):
+                logger.info(
+                    "WorldWeaver raw story field types: main_quest=%s current_chapter=%s milestones=%s",
+                    type(campaign_context.get("main_quest")).__name__,
+                    type(campaign_context.get("current_chapter")).__name__,
+                    type(campaign_context.get("milestones")).__name__,
+                )
+        normalized_payload = _normalize_world_config_payload(parsed_payload)
+        if isinstance(normalized_payload, dict):
+            normalized_world_book = normalized_payload.get("world_book", {})
+            normalized_campaign_context = (
+                normalized_world_book.get("campaign_context", {})
+                if isinstance(normalized_world_book, dict)
+                else {}
+            )
+            if isinstance(normalized_campaign_context, dict):
+                logger.info(
+                    "WorldWeaver normalized storyline: main_quest=%s chapter=%s milestone_count=%s",
+                    normalized_campaign_context.get("main_quest", {}).get("title")
+                    if isinstance(normalized_campaign_context.get("main_quest"), dict)
+                    else None,
+                    normalized_campaign_context.get("current_chapter", {}).get("title")
+                    if isinstance(normalized_campaign_context.get("current_chapter"), dict)
+                    else None,
+                    len(normalized_campaign_context.get("milestones", []))
+                    if isinstance(normalized_campaign_context.get("milestones"), list)
+                    else 0,
+                )
+        return WorldConfig.model_validate(normalized_payload)
 
     def generate_world_bundle(self, fanfic_prompt: str) -> WorldWeaverResult:
         """Generate a world configuration plus a long-form prologue chapter."""
@@ -224,10 +294,13 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         1. Identify the base intellectual property and set fanfic_meta.base_ip.
         2. Classify the universe type such as Canon, AU, Modern AU, or Crossover.
         3. Set fanfic_meta.tone_and_style to the user's requested mood and style.
-        4. Build a world glossary that maps engine abstract keys into setting-specific terms.
-        5. Preload a fitting starting_location, 1-3 key_npcs, and opening initial_quests.
-        6. Populate world_book.campaign_context with timeline-locked lore anchors.
-        7. Produce engine-facing JSON only. Do not write explanatory text outside the JSON object.
+        4. Build player_character from the requested character card and assign numeric core attributes.
+        5. Build a world glossary that maps engine abstract keys into setting-specific terms.
+        6. Preload a fitting starting_location, 1-3 key_npcs, and opening initial_quests.
+        7. Populate world_book.campaign_context with timeline-locked lore anchors.
+        8. Add world_book.campaign_context.main_quest, current_chapter, and milestones.
+        9. Add world_book.power_scaling so later scenes can judge impossible power gaps.
+        10. Produce engine-facing JSON only. Do not write explanatory text outside the JSON object.
 
         Lore generation rules for world_book.campaign_context:
         - You must anchor the setting to the exact requested era and timeline.
@@ -236,9 +309,21 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - Never introduce future characters early, never revive dead characters, and never collapse distant eras together.
         - opening_scene must be vivid and immediate: include a concrete physical location, active motion, sensory detail,
           and one urgent hook that forces the player to react.
+        - main_quest should describe the campaign's long-term objective in setting language.
+        - current_chapter should describe the immediate goal and feel like the next playable arc.
+        - milestones should expose 2-4 visible beats the player can later progress through.
+        - power_scaling must include a clear impossible gap threshold and at least three benchmark examples.
+        - power_scaling.power_tiers must define 5-8 setting-specific rank brackets with ascending min_power values.
+          Example for a ninja world: [{min_power:0, label:"下忍"}, {min_power:20, label:"中忍"}, {min_power:45, label:"上忍"}, {min_power:70, label:"影级"}, {min_power:100, label:"六道级"}].
+          The labels should use the setting's native terminology. min_power values should create reasonable progression gaps.
+        - player_character should reflect the requested role card, tone, and personal drive.
+        - player_character.objective should align with what the player wants to achieve.
+        - player_character.attributes must include stat_power, stat_agility, stat_insight,
+          stat_tenacity, and stat_presence as integer scores, usually in the 6-18 range.
 
         Glossary minimums:
         - stats should include at least stat_hp and stat_mp when the setting has a spiritual, magical, psychic, or energy resource.
+        - attributes should map stat_power, stat_agility, stat_insight, stat_tenacity, and stat_presence.
         - damage_types should include at least dmg_kinetic and dmg_energy.
         - item_categories should include at least item_weapon.
 
@@ -262,11 +347,17 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - fanfic_meta.base_ip
         - fanfic_meta.universe_type
         - fanfic_meta.tone_and_style
+        - player_character
         - world_book.campaign_context.era_and_timeline
         - world_book.campaign_context.macro_world_state
         - world_book.campaign_context.looming_crisis
         - world_book.campaign_context.opening_scene
+        - world_book.campaign_context.main_quest
+        - world_book.campaign_context.current_chapter
+        - world_book.campaign_context.milestones
+        - world_book.power_scaling
         - glossary.stats
+        - glossary.attributes
         - glossary.damage_types
         - glossary.item_categories
         - starting_location
@@ -276,12 +367,15 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
 
         Abstract keys that should be considered for glossary mapping:
         - stats: stat_hp, stat_mp
+        - attributes: stat_power, stat_agility, stat_insight, stat_tenacity, stat_presence
+        - player_character.attributes: stat_power, stat_agility, stat_insight, stat_tenacity, stat_presence
         - damage_types: dmg_kinetic, dmg_energy
         - item_categories: item_weapon
 
         Language requirements:
-        - theme, fanfic_meta.universe_type, fanfic_meta.tone_and_style, world_book.campaign_context,
-          glossary values, starting_location, key_npcs, and initial_quests should use Simplified Chinese.
+        - theme, fanfic_meta.universe_type, fanfic_meta.tone_and_style, player_character,
+          world_book.campaign_context, glossary values, starting_location, key_npcs,
+          and initial_quests should use Simplified Chinese.
         - Prefer established Chinese translations for well-known IP names when appropriate.
         """
     ).strip()
@@ -301,6 +395,7 @@ def build_prologue_prompt(
     """Assemble the long-form prologue prompt used for interactive novel mode."""
 
     campaign_context = world_config.world_book.campaign_context
+    player_character = world_config.player_character
     key_npcs = ", ".join(world_config.key_npcs[:3]) if world_config.key_npcs else "无"
     initial_quests = ", ".join(world_config.initial_quests[:3]) if world_config.initial_quests else "无"
     glossary_sample = ", ".join(
@@ -337,6 +432,9 @@ def build_prologue_prompt(
         - IP: {world_config.fanfic_meta.base_ip}
         - 宇宙类型: {world_config.fanfic_meta.universe_type}
         - 风格: {world_config.fanfic_meta.tone_and_style}
+        - 玩家角色: {player_character.name} / {player_character.role}
+        - 角色概况: {player_character.summary}
+        - 角色目标: {player_character.objective}
         - 时代时间线: {campaign_context.era_and_timeline}
         - 宏观局势: {campaign_context.macro_world_state}
         - 迫近危机: {campaign_context.looming_crisis}
@@ -382,7 +480,394 @@ def _normalize_world_config_payload(payload: Any) -> Any:
         normalized.get("initial_quests"),
         preferred_keys=("quest_name", "name", "quest_id", "id", "objective"),
     )
+    normalized["player_character"] = _normalize_player_character_payload(
+        normalized.get("player_character"),
+        normalized,
+    )
+    normalized["glossary"] = _normalize_glossary_payload(normalized.get("glossary"))
+    normalized["world_book"] = _normalize_world_book_payload(
+        normalized.get("world_book"),
+        normalized,
+    )
     return _prune_to_model_schema(normalized, WorldConfig)
+
+
+def _normalize_glossary_payload(value: Any) -> dict[str, Any]:
+    glossary = dict(value) if isinstance(value, dict) else {}
+    glossary.setdefault(
+        "attributes",
+        {
+            "stat_power": "力量",
+            "stat_agility": "敏捷",
+            "stat_insight": "洞察",
+            "stat_tenacity": "韧性",
+            "stat_presence": "魅力",
+        },
+    )
+    return glossary
+
+
+def _normalize_player_character_payload(
+    value: Any,
+    root_payload: dict[str, Any],
+) -> dict[str, Any]:
+    player_character = dict(value) if isinstance(value, dict) else {}
+    theme = _coerce_string_value(root_payload.get("theme"), preferred_keys=("name",))
+
+    player_character["name"] = _coerce_string_value(
+        player_character.get("name"),
+        preferred_keys=("player_name", "character_name"),
+    ) or "未命名旅者"
+    player_character["role"] = _coerce_string_value(
+        player_character.get("role"),
+        preferred_keys=("identity", "class", "archetype"),
+    ) or "异乡来客"
+    player_character["summary"] = _coerce_string_value(
+        player_character.get("summary"),
+        preferred_keys=("background", "description", "bio"),
+    ) or f"在{theme or '当前世界'}中被卷入风暴中心的关键角色。"
+    player_character["objective"] = _coerce_string_value(
+        player_character.get("objective"),
+        preferred_keys=("goal", "motivation", "desire"),
+    ) or "先活下来，再决定如何改写局势。"
+    player_character["attributes"] = _normalize_player_attribute_values(
+        player_character.get("attributes")
+    )
+    return player_character
+
+
+def _normalize_main_quest_payload(
+    value: Any,
+    *,
+    theme: Any,
+    looming_crisis: Any,
+) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    if isinstance(value, list):
+        first_text = next(
+            (str(item).strip() for item in value if str(item).strip()),
+            "",
+        )
+        if first_text:
+            payload.setdefault("title", first_text)
+    if isinstance(value, str) and value.strip():
+        payload.setdefault("title", value.strip())
+
+    title = _coerce_string_value(
+        payload.get("title"),
+        preferred_keys=("name", "quest_name", "objective", "goal", "summary"),
+    ) or "主线目标"
+    final_goal = _coerce_string_value(
+        payload.get("final_goal"),
+        preferred_keys=("goal", "objective", "target", "summary", "description"),
+    ) or looming_crisis or f"围绕{theme or '当前世界'}解决最终危机。"
+    summary = _coerce_string_value(
+        payload.get("summary"),
+        preferred_keys=("description", "details", "objective"),
+    ) or looming_crisis or "当前世界的长期叙事驱动力。"
+
+    return {
+        "quest_id": _coerce_abstract_key_value(
+            payload.get("quest_id"),
+            fallback="quest_main",
+        ),
+        "title": title,
+        "final_goal": final_goal,
+        "summary": summary,
+        "linked_quest_id": _coerce_abstract_key_value(payload.get("linked_quest_id")),
+        "progress_percent": _clamp_int(
+            _coerce_int_value(payload.get("progress_percent")),
+            minimum=0,
+            maximum=100,
+            fallback=0,
+        ),
+    }
+
+
+def _normalize_current_chapter_payload(
+    value: Any,
+    *,
+    opening_scene: Any,
+    looming_crisis: Any,
+) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    if isinstance(value, list):
+        first_text = next(
+            (str(item).strip() for item in value if str(item).strip()),
+            "",
+        )
+        if first_text:
+            payload.setdefault("objective", first_text)
+    if isinstance(value, str) and value.strip():
+        payload.setdefault("objective", value.strip())
+
+    title = _coerce_string_value(
+        payload.get("title"),
+        preferred_keys=("name", "chapter_name", "label"),
+    ) or "第一章"
+    objective = _coerce_string_value(
+        payload.get("objective"),
+        preferred_keys=("goal", "summary", "description", "title"),
+    ) or opening_scene or looming_crisis or "推进当前章节目标。"
+
+    return {
+        "chapter_id": _coerce_abstract_key_value(
+            payload.get("chapter_id"),
+            fallback="chapter_01",
+        ),
+        "title": title,
+        "objective": objective,
+        "tension_level": _clamp_int(
+            _coerce_int_value(payload.get("tension_level")),
+            minimum=1,
+            maximum=5,
+            fallback=3 if looming_crisis else 2,
+        ),
+        "progress_percent": _clamp_int(
+            _coerce_int_value(payload.get("progress_percent")),
+            minimum=0,
+            maximum=100,
+            fallback=0,
+        ),
+        "linked_quest_id": _coerce_abstract_key_value(payload.get("linked_quest_id")),
+    }
+
+
+def _normalize_milestones_payload(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, dict):
+        items = [value]
+    elif isinstance(value, str) and value.strip():
+        items = [value.strip()]
+    else:
+        items = []
+
+    return [
+        _normalize_milestone_payload(item, index=index)
+        for index, item in enumerate(items, start=1)
+    ]
+
+
+def _normalize_milestone_payload(value: Any, *, index: int) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    if isinstance(value, str) and value.strip():
+        payload.setdefault("title", value.strip())
+
+    title = _coerce_string_value(
+        payload.get("title"),
+        preferred_keys=("name", "milestone_name", "objective", "summary", "description"),
+    ) or f"里程碑 {index}"
+    summary = _coerce_string_value(
+        payload.get("summary"),
+        preferred_keys=("description", "objective", "details"),
+    ) or ""
+
+    return {
+        "milestone_id": _coerce_abstract_key_value(
+            payload.get("milestone_id"),
+            fallback=f"milestone_{index:02d}",
+        ),
+        "title": title,
+        "summary": summary,
+        "is_completed": _coerce_bool_value(payload.get("is_completed"), default=False),
+        "linked_quest_id": _coerce_abstract_key_value(payload.get("linked_quest_id")),
+    }
+
+
+def _default_milestones() -> list[dict[str, Any]]:
+    return [
+        {
+            "milestone_id": "milestone_01",
+            "title": "察觉危机",
+            "summary": "从开场异动中识别当前冲突。",
+            "is_completed": False,
+        },
+        {
+            "milestone_id": "milestone_02",
+            "title": "稳住局势",
+            "summary": "完成第一阶段应对并维持局面不崩盘。",
+            "is_completed": False,
+        },
+        {
+            "milestone_id": "milestone_03",
+            "title": "逼近真相",
+            "summary": "把眼前危机和更大的主线连接起来。",
+            "is_completed": False,
+        },
+    ]
+
+
+_DEFAULT_POWER_SCALING: dict[str, Any] = {
+    "scale_label": "universal_power_curve",
+    "danger_gap_threshold": 20,
+    "impossible_gap_threshold": 40,
+    "benchmark_examples": [
+        {
+            "subject": "普通对手",
+            "offense_rating": 10,
+            "defense_rating": 10,
+            "notes": "常规威胁，适合基础行动。",
+        },
+        {
+            "subject": "精英敌人",
+            "offense_rating": 40,
+            "defense_rating": 40,
+            "notes": "需要准备、克制与团队配合。",
+        },
+        {
+            "subject": "顶尖强者",
+            "offense_rating": 80,
+            "defense_rating": 80,
+            "notes": "通常只有重大成长后才有正面交锋空间。",
+        },
+    ],
+    "power_tiers": [
+        {"min_power": 0, "label": "凡人"},
+        {"min_power": 15, "label": "入门"},
+        {"min_power": 30, "label": "熟练"},
+        {"min_power": 50, "label": "精英"},
+        {"min_power": 75, "label": "大师"},
+        {"min_power": 100, "label": "传说"},
+    ],
+}
+
+
+def _normalize_power_scaling_payload(
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return dict(_DEFAULT_POWER_SCALING)
+
+    scale_label = _coerce_string_value(value.get("scale_label"), preferred_keys=("name",)) or _DEFAULT_POWER_SCALING["scale_label"]
+    danger_gap = _clamp_int(
+        _coerce_int_value(value.get("danger_gap_threshold")),
+        minimum=0,
+        maximum=999,
+        fallback=_DEFAULT_POWER_SCALING["danger_gap_threshold"],
+    )
+    impossible_gap = _clamp_int(
+        _coerce_int_value(value.get("impossible_gap_threshold")),
+        minimum=0,
+        maximum=999,
+        fallback=_DEFAULT_POWER_SCALING["impossible_gap_threshold"],
+    )
+
+    benchmark_examples: list[dict[str, Any]] = []
+    raw_benchmarks = value.get("benchmark_examples")
+    if isinstance(raw_benchmarks, list):
+        for item in raw_benchmarks:
+            if not isinstance(item, dict):
+                continue
+            subject = _coerce_string_value(item.get("subject"), preferred_keys=("name",))
+            if not subject:
+                continue
+            benchmark_examples.append({
+                "subject": subject,
+                "offense_rating": _clamp_int(
+                    _coerce_int_value(item.get("offense_rating")),
+                    minimum=0,
+                    maximum=999,
+                    fallback=0,
+                ),
+                "defense_rating": _clamp_int(
+                    _coerce_int_value(item.get("defense_rating")),
+                    minimum=0,
+                    maximum=999,
+                    fallback=0,
+                ),
+                "notes": _coerce_string_value(item.get("notes"), preferred_keys=()) or "",
+            })
+
+    if not benchmark_examples:
+        benchmark_examples = _DEFAULT_POWER_SCALING["benchmark_examples"]
+
+    # Normalize power_tiers
+    raw_power_tiers = value.get("power_tiers")
+    power_tiers: list[dict[str, Any]] = []
+    if isinstance(raw_power_tiers, list):
+        for item in raw_power_tiers:
+            if not isinstance(item, dict):
+                continue
+            min_power = _clamp_int(
+                _coerce_int_value(item.get("min_power")),
+                minimum=0,
+                maximum=9999,
+                fallback=0,
+            )
+            label = _coerce_string_value(item.get("label"), preferred_keys=("name", "rank", "title")) or ""
+            if not label:
+                continue
+            power_tiers.append({
+                "min_power": min_power,
+                "label": label,
+            })
+    if not power_tiers:
+        power_tiers = _DEFAULT_POWER_SCALING["power_tiers"]
+
+    return {
+        "scale_label": scale_label,
+        "danger_gap_threshold": danger_gap,
+        "impossible_gap_threshold": impossible_gap,
+        "benchmark_examples": benchmark_examples,
+        "power_tiers": power_tiers,
+    }
+
+
+def _normalize_world_book_payload(
+    value: Any,
+    root_payload: dict[str, Any],
+) -> dict[str, Any]:
+    world_book = dict(value) if isinstance(value, dict) else {}
+    campaign_context = dict(world_book.get("campaign_context")) if isinstance(world_book.get("campaign_context"), dict) else {}
+
+    theme = _coerce_string_value(root_payload.get("theme"), preferred_keys=("name",))
+    looming_crisis = _coerce_string_value(campaign_context.get("looming_crisis"), preferred_keys=())
+    opening_scene = _coerce_string_value(campaign_context.get("opening_scene"), preferred_keys=())
+    macro_world_state = _coerce_string_value(campaign_context.get("macro_world_state"), preferred_keys=())
+    era_and_timeline = _coerce_string_value(campaign_context.get("era_and_timeline"), preferred_keys=())
+
+    campaign_context["main_quest"] = _normalize_main_quest_payload(
+        campaign_context.get("main_quest"),
+        theme=theme,
+        looming_crisis=looming_crisis,
+    )
+    campaign_context["current_chapter"] = _normalize_current_chapter_payload(
+        campaign_context.get("current_chapter"),
+        opening_scene=opening_scene,
+        looming_crisis=looming_crisis,
+    )
+    campaign_context["milestones"] = _normalize_milestones_payload(
+        campaign_context.get("milestones")
+    )
+    if not campaign_context["milestones"]:
+        campaign_context["milestones"] = _default_milestones()
+
+    campaign_context["era_and_timeline"] = era_and_timeline or "未知时代节点"
+    campaign_context["macro_world_state"] = macro_world_state or "宏观局势尚待展开。"
+    campaign_context["looming_crisis"] = looming_crisis or "当前危机尚未完全揭示。"
+    campaign_context["opening_scene"] = opening_scene or "故事从一个临界时刻开始。"
+    world_book["campaign_context"] = campaign_context
+    world_book["power_scaling"] = _normalize_power_scaling_payload(
+        world_book.get("power_scaling"),
+    )
+    return world_book
+
+
+def _normalize_player_attribute_values(value: Any) -> dict[str, int]:
+    attributes: dict[str, int] = {}
+
+    if isinstance(value, dict):
+        for key, raw_value in value.items():
+            normalized_key = str(key).strip()
+            normalized_value = _coerce_int_value(raw_value)
+            if normalized_key and normalized_value is not None:
+                attributes[normalized_key] = max(1, min(20, normalized_value))
+
+    for key, default_value in DEFAULT_PLAYER_CHARACTER_ATTRIBUTES.items():
+        attributes.setdefault(key, default_value)
+
+    return attributes
 
 
 def _build_world_config_validation_error_message(error: Exception | None) -> str:
@@ -511,3 +996,64 @@ def _coerce_string_value(
                 return candidate.strip()
 
     return value
+
+
+def _coerce_int_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool_value(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+def _coerce_abstract_key_value(value: Any, *, fallback: str | None = None) -> str | None:
+    if not isinstance(value, str):
+        return fallback
+
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"[^a-z0-9_]", "", normalized)
+    if normalized and ABSTRACT_KEY_PATTERN.fullmatch(normalized):
+        return normalized
+    return fallback
+
+
+def _clamp_int(
+    value: int | None,
+    *,
+    minimum: int,
+    maximum: int,
+    fallback: int,
+) -> int:
+    if value is None:
+        return fallback
+    return max(minimum, min(maximum, value))
+
+
+def _log_preview(value: Any, *, limit: int = 240) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."

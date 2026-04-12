@@ -27,7 +27,7 @@ class LLMSettings(EngineBaseModel):
     api_key: SecretStr = Field(alias="LLM_API_KEY")
     base_url: str = Field(alias="LLM_BASE_URL")
     model_name: str = Field(alias="LLM_MODEL_NAME")
-    request_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    request_timeout_seconds: float = Field(default=60.0, gt=0.0)
     json_schema_preferred: bool = True
 
     @field_validator("base_url")
@@ -55,7 +55,7 @@ class LLMSettings(EngineBaseModel):
             load_dotenv(dotenv_path=env_path, override=False)
 
         try:
-            timeout_raw = os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "30")
+            timeout_raw = os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60")
             json_schema_raw = os.getenv("LLM_JSON_SCHEMA_PREFERRED", "true")
             return cls.model_validate(
                 {

@@ -9,10 +9,11 @@ export function SandboxRoot() {
   const gameState = useSandboxStore((state) => state.gameState);
   const errorMessage = useSandboxStore((state) => state.errorMessage);
   const isLoading = useSandboxStore((state) => state.isLoading);
+  const activeTurnStream = useSandboxStore((state) => state.activeTurnStream);
   const reset = useSandboxStore((state) => state.reset);
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell${gameState ? "" : " is-genesis"}`}>
       <div className="background-layers" aria-hidden="true">
         <span className="background-orb orb-left" />
         <span className="background-orb orb-right" />
@@ -28,11 +29,18 @@ export function SandboxRoot() {
         </div>
       ) : null}
 
-      <SessionVault />
+      {gameState ? (
+        <SandboxConsole />
+      ) : (
+        <>
+          <SessionVault />
+          <GenesisView />
+        </>
+      )}
 
-      {gameState ? <SandboxConsole /> : <GenesisView />}
-
-      {isLoading ? <div className="loading-scrim" aria-hidden="true" /> : null}
+      {isLoading && !activeTurnStream ? (
+        <div className="loading-scrim" aria-hidden="true" />
+      ) : null}
     </main>
   );
 }

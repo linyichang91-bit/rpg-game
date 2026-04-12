@@ -6,6 +6,10 @@ import { exportGameSave, resetGameSession, restoreGame } from "@/lib/api";
 import { useSandboxStore } from "@/lib/store";
 import type { SaveSlot } from "@/lib/types";
 
+type SessionVaultProps = {
+  compact?: boolean;
+};
+
 function formatSavedAt(timestamp: number): string {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -31,7 +35,7 @@ function getLatestNarration(slot: SaveSlot): string {
   return latestSystemLog?.text.trim() ?? "该存档尚未记录旁白。";
 }
 
-export function SessionVault() {
+export function SessionVault({ compact = false }: SessionVaultProps) {
   const sessionId = useSandboxStore((state) => state.sessionId);
   const gameState = useSandboxStore((state) => state.gameState);
   const saveSlots = useSandboxStore((state) => state.saveSlots);
@@ -58,8 +62,7 @@ export function SessionVault() {
       createSaveSlot(response.runtime_snapshot);
       setIsOpen(true);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "保存存档失败。";
+      const message = error instanceof Error ? error.message : "保存存档失败。";
       setError(message);
     } finally {
       setLoading(false);
@@ -86,8 +89,7 @@ export function SessionVault() {
       });
       setIsOpen(false);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "读档失败。";
+      const message = error instanceof Error ? error.message : "读档失败。";
       setError(message);
     } finally {
       setLoading(false);
@@ -99,7 +101,7 @@ export function SessionVault() {
       return;
     }
 
-    if (!window.confirm("重置当前冒险会清空未保存进度，继续吗？")) {
+    if (!window.confirm("重置当前冒险会清空未保存进度，确定继续吗？")) {
       return;
     }
 
@@ -121,31 +123,32 @@ export function SessionVault() {
   }
 
   function handleDelete(slotId: string) {
-    if (!window.confirm("删除这个存档后将无法恢复，继续吗？")) {
+    if (!window.confirm("删除这个存档后将无法恢复，确定继续吗？")) {
       return;
     }
     deleteSaveSlot(slotId);
   }
 
   function handleClearAll() {
-    if (!window.confirm("这会清空全部本地存档，继续吗？")) {
+    if (!window.confirm("这会清空全部本地存档，确定继续吗？")) {
       return;
     }
     clearSaveSlots();
   }
 
   return (
-    <>
-      <section className="session-toolbar panel">
-        <div className="session-toolbar-copy">
-          <span className="panel-kicker">档案舱</span>
-          <strong className="session-toolbar-title">
-            {gameState ? "当前冒险在线" : "等待载入或开新局"}
-          </strong>
-          <span className="session-toolbar-meta">
-            {`本地存档 ${saveSlots.length} 个`}
-          </span>
-        </div>
+    <div className="session-vault-container">
+      <section className={`session-toolbar panel${compact ? " compact" : ""}`}>
+        {!compact ? (
+          <div className="session-toolbar-copy">
+            <strong className="session-toolbar-title">
+              {gameState ? "当前冒险在线" : "等待载入或开新局"}
+            </strong>
+            <span className="session-toolbar-meta">
+              {`本地存档 ${saveSlots.length} 个`}
+            </span>
+          </div>
+        ) : null}
 
         <div className="session-toolbar-actions">
           {gameState ? (
@@ -155,7 +158,7 @@ export function SessionVault() {
               onClick={handleSave}
               type="button"
             >
-              保存进度
+              {compact ? "保存" : "保存进度"}
             </button>
           ) : null}
           <button
@@ -163,7 +166,7 @@ export function SessionVault() {
             onClick={() => setIsOpen((current) => !current)}
             type="button"
           >
-            {isOpen ? "收起存档" : "查看存档"}
+            {isOpen ? "收起存档" : compact ? `存档 ${saveSlots.length}` : "查看存档"}
           </button>
           {gameState ? (
             <button
@@ -172,7 +175,7 @@ export function SessionVault() {
               onClick={handleResetCurrent}
               type="button"
             >
-              重置当前
+              重置
             </button>
           ) : null}
         </div>
@@ -208,7 +211,9 @@ export function SessionVault() {
                     <div>
                       <h3>{slot.label}</h3>
                       <p>
-                        {`${slot.snapshot.game_state.world_config.theme} · ${getLocationLabel(slot)}`}
+                        {`${slot.snapshot.game_state.world_config.theme} · ${getLocationLabel(
+                          slot
+                        )}`}
                       </p>
                     </div>
                     <span className="save-slot-time">
@@ -241,6 +246,6 @@ export function SessionVault() {
           )}
         </section>
       ) : null}
-    </>
+    </div>
   );
 }

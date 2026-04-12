@@ -13,8 +13,8 @@ DEFAULT_ACTION = "attack"
 DEFAULT_REACTION_ACTION = "counter_attack"
 DEFAULT_DAMAGE_TYPE_KEY = "dmg_kinetic"
 DEFAULT_HP_STAT_KEY = "stat_hp"
-DEFAULT_ATTACK_ATTRIBUTE_KEY = "attr_dex"
-DEFAULT_DEFENSE_ATTRIBUTE_KEY = "attr_dex"
+DEFAULT_ATTACK_ATTRIBUTE_KEY = "stat_agility"
+DEFAULT_DEFENSE_ATTRIBUTE_KEY = "stat_agility"
 DEFAULT_HIT_DC = 12
 DEFAULT_BASE_DAMAGE = 5
 DEFAULT_ENEMY_BASE_DAMAGE = 4
@@ -140,7 +140,10 @@ def _resolve_player_action(
             DEFAULT_ATTACK_ATTRIBUTE_KEY,
         ),
     )
-    attribute_score = current_state.player.attributes.get(attack_attribute_key, 10)
+    attribute_score = _resolve_attribute_score(
+        current_state.player.attributes,
+        attack_attribute_key,
+    )
     attribute_modifier = _score_to_modifier(attribute_score)
     attack_bonus = _as_int(parameters.get("attack_bonus"), 0)
     dc = _as_int(
@@ -184,8 +187,14 @@ def _resolve_player_action(
     damage_bonus = _as_int(parameters.get("damage_bonus"), 0) + max(attribute_modifier, 0)
     damage = max(0, base_damage + damage_bonus)
 
-    if roll == 20:
-        damage += _as_int(parameters.get("critical_bonus_damage"), base_damage)
+    # Critical hit: add doubled base damage on top of the normal hit
+    critical_bonus = _apply_critical_damage(
+        roll=roll,
+        base_damage=base_damage,
+        result_tags=result_tags,
+        extra_critical_bonus=_as_int(parameters.get("critical_bonus_damage"), 0),
+    )
+    damage += critical_bonus
 
     logs.append(
         MutationLog(
@@ -254,7 +263,10 @@ def _resolve_enemy_reaction(
             DEFAULT_ATTACK_ATTRIBUTE_KEY,
         ),
     )
-    enemy_attribute_score = enemy_entity.attributes.get(enemy_attack_attribute_key, 10)
+    enemy_attribute_score = _resolve_attribute_score(
+        enemy_entity.attributes,
+        enemy_attack_attribute_key,
+    )
     enemy_attack_modifier = _score_to_modifier(enemy_attribute_score)
     enemy_attack_bonus = _as_int(
         current_state.world_config.mechanics.get("combat_enemy_attack_bonus"),
@@ -268,7 +280,10 @@ def _resolve_enemy_reaction(
             DEFAULT_DEFENSE_ATTRIBUTE_KEY,
         ),
     )
-    player_defense_score = current_state.player.attributes.get(player_defense_attribute_key, 10)
+    player_defense_score = _resolve_attribute_score(
+        current_state.player.attributes,
+        player_defense_attribute_key,
+    )
     player_defense_modifier = _score_to_modifier(player_defense_score)
     reaction_dc = _as_int(
         current_state.world_config.mechanics.get("combat_enemy_hit_dc"),
@@ -314,8 +329,13 @@ def _resolve_enemy_reaction(
     damage_bonus = max(enemy_attack_modifier, 0)
     damage = max(0, base_damage + damage_bonus)
 
-    if roll == 20:
-        damage += base_damage
+    # Critical hit: enemy doubles base damage on natural 20
+    critical_bonus = _apply_critical_damage(
+        roll=roll,
+        base_damage=base_damage,
+        result_tags=result_tags,
+    )
+    damage += critical_bonus
 
     logs.append(
         MutationLog(
@@ -396,15 +416,68 @@ def _is_successful_hit(
         result_tags.extend(["missed", "critical_miss"])
         return False
 
-    if roll == 20:
+    success = roll + modifier >= dc
+    if roll == 20 and success:
         result_tags.append("critical_hit")
-        return True
+    elif roll == 20:
+        result_tags.append("critical_roll")
+    return success
 
-    return roll + modifier >= dc
+
+def _apply_critical_damage(
+    *,
+    roll: int,
+    base_damage: int,
+    result_tags: list[str],
+    extra_critical_bonus: int = 0,
+) -> int:
+    """Calculate bonus damage for a critical hit.
+
+    On a natural 20 that also beats the DC (``critical_hit`` tag), damage
+    is doubled.  A natural 20 that misses the DC (``critical_roll``) still
+    lands a glancing blow worth half the base damage (rounded down).
+
+    The *extra_critical_bonus* parameter allows the caller to add an
+    additional flat bonus on top of the doubled base (e.g. the GM's
+    ``critical_bonus_damage`` parameter).
+    """
+    if "critical_hit" in result_tags:
+        # Full critical: double base damage + optional bonus
+        return base_damage + extra_critical_bonus
+    if "critical_roll" in result_tags:
+        # Glancing critical: half base, minimum 1
+        return max(1, base_damage // 2)
+    return 0
 
 
 def _score_to_modifier(score: int) -> int:
     return (score - 10) // 2
+
+
+def _resolve_attribute_score(attributes: dict[str, int], requested_key: str) -> int:
+    if requested_key in attributes:
+        return attributes[requested_key]
+
+    for candidate in _attribute_aliases_for(requested_key):
+        if candidate in attributes:
+            return attributes[candidate]
+
+    return 10
+
+
+def _attribute_aliases_for(requested_key: str) -> tuple[str, ...]:
+    normalized = str(requested_key).strip().lower()
+    if normalized in {"stat_agility", "attr_dex", "agility", "dex", "dexterity"}:
+        return ("stat_agility", "attr_dex")
+    if normalized in {"stat_power", "attr_power", "power", "strength"}:
+        return ("stat_power", "attr_power")
+    if normalized in {"stat_tenacity", "attr_will", "tenacity", "will"}:
+        return ("stat_tenacity", "attr_will")
+    if normalized in {"stat_insight", "attr_focus", "insight", "focus", "perception"}:
+        return ("stat_insight", "attr_focus")
+    if normalized in {"stat_presence", "presence", "charisma"}:
+        return ("stat_presence",)
+    return ()
 
 
 def _build_event(

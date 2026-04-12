@@ -24,6 +24,7 @@ class FakeStructuredJSONClient:
 
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
 
     def generate_json(
         self,
@@ -32,7 +33,13 @@ class FakeStructuredJSONClient:
         user_prompt: str,
         response_schema: dict[str, object],
     ) -> str:
-        del system_prompt, user_prompt, response_schema
+        self.calls.append(
+            {
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "response_schema": response_schema,
+            }
+        )
         return self._responses.pop(0)
 
 
@@ -64,20 +71,20 @@ def build_state() -> GameState:
             ),
             world_book={
                 "campaign_context": {
-                    "era_and_timeline": "咒术高专冬季封锁周，第4天夜里",
-                    "macro_world_state": "废弃城区已经被诅咒污染，高专派出的清剿小队在黑夜里逐片推进。",
-                    "looming_crisis": "污染核心正在苏醒，如果不能尽快摸清遗迹内部结构，整片街区都会失控。",
-                    "opening_scene": "你踩着碎玻璃进入坍塌走廊，远处墙缝渗出黑色咒雾，脚边忽然滚来一枚带血的校徽。",
+                    "era_and_timeline": "Winter lockdown, night three",
+                    "macro_world_state": "The abandoned district is saturated with curses while cleanup squads advance one street at a time.",
+                    "looming_crisis": "If the core curse wakes before the route is mapped, the whole district will be lost.",
+                    "opening_scene": "Broken glass crunches underfoot as a black curse-mist leaks from the far wall.",
                 }
             },
             glossary=WorldGlossary(
-                stats={"stat_hp": "生命值"},
-                damage_types={"dmg_kinetic": "冲击"},
-                item_categories={"item_weapon": "武器"},
+                stats={"stat_hp": "Vitality"},
+                damage_types={"dmg_kinetic": "Impact"},
+                item_categories={"item_weapon": "Weapon"},
             ),
             starting_location="location_ruined_corridor",
-            key_npcs=["二级咒灵"],
-            initial_quests=["活下去"],
+            key_npcs=["Grade 2 Curse"],
+            initial_quests=["Make it out alive"],
         ),
     )
 
@@ -91,18 +98,17 @@ def test_loot_generator_normalizes_candidates_and_assigns_unique_temp_keys() -> 
                         "candidates": [
                             {
                                 "temp_key": "ignored_model_key",
-                                "name": "干瘪的宿傩手指（残片）",
+                                "name": "Cracked Finger Bone",
                                 "dc": 18,
                                 "type": "item_material",
                             },
                             {
-                                "name": "沾染咒力的制服纽扣",
+                                "name": "Threaded Uniform Cord",
                                 "dc": 8,
                                 "type": "item_junk",
                             },
                         ]
-                    },
-                    ensure_ascii=False,
+                    }
                 )
             ]
         )
@@ -116,8 +122,8 @@ def test_loot_generator_normalizes_candidates_and_assigns_unique_temp_keys() -> 
 
     pool = generator.generate_pool(
         world_config=build_state().world_config,
-        target_name="倒下的咒灵残骸",
-        user_input="我仔细搜查倒下的敌人尸体",
+        target_name="Fallen Curse Remains",
+        user_input="I search the remains carefully.",
         temp_key_factory=temp_key_factory,
     )
 
@@ -125,8 +131,73 @@ def test_loot_generator_normalizes_candidates_and_assigns_unique_temp_keys() -> 
         "item_temp_loot_0001",
         "item_temp_loot_0002",
     ]
-    assert pool.candidates[0].name == "干瘪的宿傩手指（残片）"
+    assert pool.candidates[0].name == "Cracked Finger Bone"
     assert pool.candidates[1].type == "item_junk"
+
+
+def test_loot_generator_retries_invalid_payload_and_recovers() -> None:
+    client = FakeStructuredJSONClient(
+        [
+            json.dumps({"candidates": []}),
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "name": "Sealed Talisman Scrap",
+                            "dc": 11,
+                            "type": "item_clue",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    generator = LootGenerator(client)
+    counter = 0
+
+    def temp_key_factory() -> str:
+        nonlocal counter
+        counter += 1
+        return f"item_temp_retry_{counter:04d}"
+
+    pool = generator.generate_pool(
+        world_config=build_state().world_config,
+        target_name="Fallen Curse Remains",
+        user_input="I search the remains carefully.",
+        temp_key_factory=temp_key_factory,
+    )
+
+    assert len(pool.candidates) == 1
+    assert pool.candidates[0].name == "Sealed Talisman Scrap"
+    assert len(client.calls) == 2
+
+
+def test_loot_generator_falls_back_after_three_invalid_attempts() -> None:
+    client = FakeStructuredJSONClient(
+        [
+            "{}",
+            json.dumps({"candidates": []}),
+            "[]",
+        ]
+    )
+    generator = LootGenerator(client)
+    counter = 0
+
+    def temp_key_factory() -> str:
+        nonlocal counter
+        counter += 1
+        return f"item_temp_fallback_{counter:04d}"
+
+    pool = generator.generate_pool(
+        world_config=build_state().world_config,
+        target_name="Fallen Curse Remains",
+        user_input="I search the remains carefully.",
+        temp_key_factory=temp_key_factory,
+    )
+
+    assert len(pool.candidates) >= 1
+    assert pool.candidates[0].temp_key == "item_temp_fallback_0001"
+    assert len(client.calls) == 3
 
 
 def test_resolve_loot_registers_temporary_items_and_inventory(monkeypatch) -> None:
@@ -138,13 +209,13 @@ def test_resolve_loot_registers_temporary_items_and_inventory(monkeypatch) -> No
             "candidates": [
                 {
                     "temp_key": "item_temp_loot_0001",
-                    "name": "干瘪的宿傩手指（残片）",
+                    "name": "Cracked Finger Bone",
                     "dc": 18,
                     "type": "item_material",
                 },
                 {
                     "temp_key": "item_temp_loot_0002",
-                    "name": "沾染咒力的制服纽扣",
+                    "name": "Threaded Uniform Cord",
                     "dc": 8,
                     "type": "item_junk",
                 },
@@ -156,7 +227,7 @@ def test_resolve_loot_registers_temporary_items_and_inventory(monkeypatch) -> No
         state,
         {"action_type": "loot"},
         loot_pool=loot_pool,
-        target_label="二级咒灵的尸体",
+        target_label="Grade 2 Curse Corpse",
     )
     next_state = apply_mutations(state, logs)
 
@@ -168,8 +239,8 @@ def test_resolve_loot_registers_temporary_items_and_inventory(monkeypatch) -> No
     assert "found_item_temp_loot_0002" in event.result_tags
     assert next_state.player.inventory["item_temp_loot_0001"] == 1
     assert next_state.player.inventory["item_temp_loot_0002"] == 1
-    assert next_state.player.temporary_items["item_temp_loot_0001"] == "干瘪的宿傩手指（残片）"
-    assert next_state.player.temporary_items["item_temp_loot_0002"] == "沾染咒力的制服纽扣"
+    assert next_state.player.temporary_items["item_temp_loot_0001"] == "Cracked Finger Bone"
+    assert next_state.player.temporary_items["item_temp_loot_0002"] == "Threaded Uniform Cord"
     assert next_state.world_config.glossary.item_categories["item_material"] == "素材"
     assert next_state.world_config.glossary.item_categories["item_junk"] == "杂物"
 
@@ -183,7 +254,7 @@ def test_resolve_loot_can_fail_cleanly_when_roll_is_too_low(monkeypatch) -> None
             "candidates": [
                 {
                     "temp_key": "item_temp_loot_0001",
-                    "name": "沾染咒力的制服纽扣",
+                    "name": "Threaded Uniform Cord",
                     "dc": 8,
                     "type": "item_junk",
                 }
@@ -195,7 +266,7 @@ def test_resolve_loot_can_fail_cleanly_when_roll_is_too_low(monkeypatch) -> None
         state,
         {"action_type": "loot"},
         loot_pool=loot_pool,
-        target_label="二级咒灵的尸体",
+        target_label="Grade 2 Curse Corpse",
     )
 
     assert logs == []
@@ -212,9 +283,9 @@ def test_resolve_loot_turn_blocks_nonexistent_corpse_target() -> None:
         record,
         {
             "action_type": "loot",
-            "raw_target_text": "倒下的敌人尸体",
+            "target_id": "corpse_missing",
         },
-        user_input="我仔细搜查倒下的敌人尸体",
+        user_input="I search the missing corpse.",
     )
 
     assert logs == []
@@ -233,7 +304,7 @@ def test_resolve_loot_turn_blocks_non_lootable_explicit_target_id() -> None:
             "action_type": "loot",
             "target_id": "enemy_01",
         },
-        user_input="我搜查敌人尸体",
+        user_input="I search the enemy corpse.",
     )
 
     assert logs == []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -304,6 +305,29 @@ class OpenAICompatibleToolClient:
             ],
         }
 
+    async def stream_text(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """Yield assistant text deltas from a streaming chat-completion request."""
+
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._settings.model_name,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
+        except Exception as exc:
+            raise LLMGatewayError("LLM gateway streaming request failed.") from exc
+
+        async for chunk in stream:
+            delta = _extract_stream_text_delta(chunk)
+            if delta:
+                yield delta
+
 
 def _should_fallback_to_json_object(exc: Exception) -> bool:
     message = str(exc).lower()
@@ -378,6 +402,39 @@ def _extract_optional_text_content(message: Any) -> str | None:
         return normalized or None
 
     return None
+
+
+def _extract_stream_text_delta(chunk: Any) -> str:
+    try:
+        delta = chunk.choices[0].delta
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ""
+
+    content = getattr(delta, "content", None)
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        fragments: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                fragments.append(item)
+                continue
+
+            text_value = getattr(item, "text", None)
+            if isinstance(text_value, str):
+                fragments.append(text_value)
+                continue
+
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                fragments.append(item["text"])
+
+        return "".join(fragments)
+
+    return ""
 
 
 def _extract_tool_calls(message: Any) -> list[ToolCallRequest]:
