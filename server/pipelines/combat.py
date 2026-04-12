@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Any
 
+from server.runtime.power_level import compute_attributes_power_level
 from server.schemas.core import ExecutedEvent, GameState, MutationLog, RuntimeEntityState
 
 
@@ -19,6 +21,19 @@ DEFAULT_HIT_DC = 12
 DEFAULT_BASE_DAMAGE = 5
 DEFAULT_ENEMY_BASE_DAMAGE = 4
 DEFAULT_UNARMED_WEAPON_KEY = "item_unarmed"
+DEFAULT_POWER_GAP_THRESHOLD = 20
+DEFAULT_POWER_GAP_STEP_ATTACK_BONUS = 2
+DEFAULT_POWER_GAP_STEP_DAMAGE_BONUS = 3
+MAX_POWER_GAP_STEPS = 4
+
+
+@dataclass(frozen=True)
+class PowerGapAdjustment:
+    attack_bonus: int
+    damage_bonus: int
+    step_count: int
+    overwhelming: bool
+    overmatched: bool
 
 
 def resolve_combat(
@@ -145,19 +160,35 @@ def _resolve_player_action(
         attack_attribute_key,
     )
     attribute_modifier = _score_to_modifier(attribute_score)
+    power_gap = _resolve_power_gap_adjustment(
+        current_state=current_state,
+        attacker_attributes=current_state.player.attributes,
+        defender_attributes=target_entity.attributes,
+        attacker_level=current_state.player.growth.level,
+        attacker_skill_total=_sum_skill_levels(current_state.player.skills),
+    )
     attack_bonus = _as_int(parameters.get("attack_bonus"), 0)
     dc = _as_int(
         parameters.get("target_dc"),
         _as_int(current_state.world_config.mechanics.get("combat_hit_dc"), DEFAULT_HIT_DC),
     )
 
-    result_tags: list[str] = []
-    is_success = _is_successful_hit(
+    result_tags = _build_power_gap_tags(power_gap)
+    forced_outcome = _resolve_forced_hit_outcome(
         roll=roll,
-        modifier=attribute_modifier + attack_bonus,
-        dc=dc,
+        power_gap=power_gap,
         result_tags=result_tags,
     )
+
+    if forced_outcome is None:
+        is_success = _is_successful_hit(
+            roll=roll,
+            modifier=attribute_modifier + attack_bonus + power_gap.attack_bonus,
+            dc=dc,
+            result_tags=result_tags,
+        )
+    else:
+        is_success = forced_outcome
 
     if not is_success:
         if "missed" not in result_tags:
@@ -184,7 +215,11 @@ def _resolve_player_action(
         parameters.get("base_damage"),
         _as_int(current_state.world_config.mechanics.get("combat_base_damage"), DEFAULT_BASE_DAMAGE),
     )
-    damage_bonus = _as_int(parameters.get("damage_bonus"), 0) + max(attribute_modifier, 0)
+    damage_bonus = (
+        _as_int(parameters.get("damage_bonus"), 0)
+        + max(attribute_modifier, 0)
+        + power_gap.damage_bonus
+    )
     damage = max(0, base_damage + damage_bonus)
 
     # Critical hit: add doubled base damage on top of the normal hit
@@ -195,6 +230,8 @@ def _resolve_player_action(
         extra_critical_bonus=_as_int(parameters.get("critical_bonus_damage"), 0),
     )
     damage += critical_bonus
+    if power_gap.overwhelming:
+        damage = max(damage, base_damage + max(2, power_gap.damage_bonus))
 
     logs.append(
         MutationLog(
@@ -268,6 +305,13 @@ def _resolve_enemy_reaction(
         enemy_attack_attribute_key,
     )
     enemy_attack_modifier = _score_to_modifier(enemy_attribute_score)
+    power_gap = _resolve_power_gap_adjustment(
+        current_state=current_state,
+        attacker_attributes=enemy_entity.attributes,
+        defender_attributes=current_state.player.attributes,
+        defender_level=current_state.player.growth.level,
+        defender_skill_total=_sum_skill_levels(current_state.player.skills),
+    )
     enemy_attack_bonus = _as_int(
         current_state.world_config.mechanics.get("combat_enemy_attack_bonus"),
         0,
@@ -291,13 +335,22 @@ def _resolve_enemy_reaction(
     ) + max(player_defense_modifier, 0)
 
     roll = random.randint(1, 20)
-    result_tags: list[str] = []
-    is_success = _is_successful_hit(
+    result_tags = _build_power_gap_tags(power_gap)
+    forced_outcome = _resolve_forced_hit_outcome(
         roll=roll,
-        modifier=enemy_attack_modifier + enemy_attack_bonus,
-        dc=reaction_dc,
+        power_gap=power_gap,
         result_tags=result_tags,
     )
+
+    if forced_outcome is None:
+        is_success = _is_successful_hit(
+            roll=roll,
+            modifier=enemy_attack_modifier + enemy_attack_bonus + power_gap.attack_bonus,
+            dc=reaction_dc,
+            result_tags=result_tags,
+        )
+    else:
+        is_success = forced_outcome
 
     if not is_success:
         if "missed" not in result_tags:
@@ -326,7 +379,7 @@ def _resolve_enemy_reaction(
         ),
         DEFAULT_ENEMY_BASE_DAMAGE,
     )
-    damage_bonus = max(enemy_attack_modifier, 0)
+    damage_bonus = max(enemy_attack_modifier, 0) + power_gap.damage_bonus
     damage = max(0, base_damage + damage_bonus)
 
     # Critical hit: enemy doubles base damage on natural 20
@@ -336,6 +389,8 @@ def _resolve_enemy_reaction(
         result_tags=result_tags,
     )
     damage += critical_bonus
+    if power_gap.overwhelming:
+        damage = max(damage, base_damage + max(2, power_gap.damage_bonus))
 
     logs.append(
         MutationLog(
@@ -359,6 +414,82 @@ def _resolve_enemy_reaction(
         abstract_action=DEFAULT_REACTION_ACTION,
         result_tags=result_tags,
     )
+
+
+def _resolve_power_gap_adjustment(
+    *,
+    current_state: GameState,
+    attacker_attributes: dict[str, int],
+    defender_attributes: dict[str, int],
+    attacker_level: int = 1,
+    defender_level: int = 1,
+    attacker_skill_total: int = 0,
+    defender_skill_total: int = 0,
+) -> PowerGapAdjustment:
+    power_scaling = current_state.world_config.world_book.power_scaling
+    danger_gap = max(1, power_scaling.danger_gap_threshold or DEFAULT_POWER_GAP_THRESHOLD)
+    impossible_gap = max(danger_gap, power_scaling.impossible_gap_threshold or danger_gap * 2)
+
+    attacker_power = compute_attributes_power_level(
+        attacker_attributes,
+        level=attacker_level,
+        skill_total=attacker_skill_total,
+    )
+    defender_power = compute_attributes_power_level(
+        defender_attributes,
+        level=defender_level,
+        skill_total=defender_skill_total,
+    )
+    gap = attacker_power - defender_power
+    step_count = max(-MAX_POWER_GAP_STEPS, min(MAX_POWER_GAP_STEPS, int(gap / danger_gap)))
+
+    return PowerGapAdjustment(
+        attack_bonus=step_count * DEFAULT_POWER_GAP_STEP_ATTACK_BONUS,
+        damage_bonus=step_count * DEFAULT_POWER_GAP_STEP_DAMAGE_BONUS,
+        step_count=step_count,
+        overwhelming=gap >= impossible_gap,
+        overmatched=gap <= -impossible_gap,
+    )
+
+
+def _build_power_gap_tags(power_gap: PowerGapAdjustment) -> list[str]:
+    tags: list[str] = []
+    if power_gap.step_count > 0:
+        tags.append(f"power_gap_advantage:{power_gap.step_count}")
+    elif power_gap.step_count < 0:
+        tags.append(f"power_gap_penalty:{abs(power_gap.step_count)}")
+
+    if power_gap.overwhelming:
+        tags.append("power_gap_overwhelming")
+    elif power_gap.overmatched:
+        tags.append("power_gap_overmatched")
+
+    return tags
+
+
+def _resolve_forced_hit_outcome(
+    *,
+    roll: int,
+    power_gap: PowerGapAdjustment,
+    result_tags: list[str],
+) -> bool | None:
+    if roll == 1:
+        result_tags.extend(["missed", "critical_miss"])
+        return False
+
+    if power_gap.overwhelming:
+        if roll == 20 and "critical_hit" not in result_tags:
+            result_tags.append("critical_hit")
+        return True
+
+    if power_gap.overmatched and roll != 20:
+        if "power_gap_blocked" not in result_tags:
+            result_tags.append("power_gap_blocked")
+        if "missed" not in result_tags:
+            result_tags.append("missed")
+        return False
+
+    return None
 
 
 def _resolve_weapon_key(parameters: dict[str, Any]) -> str:
@@ -452,6 +583,10 @@ def _apply_critical_damage(
 
 def _score_to_modifier(score: int) -> int:
     return (score - 10) // 2
+
+
+def _sum_skill_levels(skills: dict[str, int]) -> int:
+    return sum(skills.values()) if skills else 0
 
 
 def _resolve_attribute_score(attributes: dict[str, int], requested_key: str) -> int:

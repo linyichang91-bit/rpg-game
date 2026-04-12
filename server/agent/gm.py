@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from textwrap import dedent
 from typing import Any, Protocol
+
+logger = logging.getLogger("uvicorn.error")
 
 from server.agent.runtime_tools import (
     clone_session_record,
@@ -72,7 +75,7 @@ class GameMasterAgent:
         self,
         llm_client: ToolCallingNarrativeClient,
         *,
-        max_tool_rounds: int = 6,
+        max_tool_rounds: int = 8,
     ) -> None:
         self._llm_client = llm_client
         self._max_tool_rounds = max_tool_rounds
@@ -134,7 +137,7 @@ class GameMasterAgent:
         ]
         tools = get_runtime_tool_schemas()
 
-        for _ in range(self._max_tool_rounds):
+        for round_idx in range(self._max_tool_rounds):
             response = await self._llm_client.complete_chat(
                 messages=messages,
                 tools=tools,
@@ -153,6 +156,10 @@ class GameMasterAgent:
                     )
                     all_events.extend(execution.executed_events)
                     all_logs.extend(execution.mutation_logs)
+                    logger.info(
+                        "[GM run_turn] round=%d tool=%s events=%d",
+                        round_idx, tool_call["name"], len(execution.executed_events),
+                    )
                     messages.append(
                         {
                             "role": "tool",
@@ -168,11 +175,16 @@ class GameMasterAgent:
 
             narration = str(response.get("content") or "").strip()
             if narration:
+                logger.info(
+                    "[GM run_turn] round=%d narration received, len=%d chars=%d",
+                    round_idx, len(narration), _count_visible_characters(narration),
+                )
                 follow_up_instruction = _build_missing_resolution_instruction(
                     user_input=user_input,
                     executed_events=all_events,
                 )
                 if follow_up_instruction is not None:
+                    logger.info("[GM run_turn] round=%d -> missing resolution, looping", round_idx)
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -184,6 +196,7 @@ class GameMasterAgent:
 
                 rewrite_instruction = _build_narrative_rewrite_instruction(narration)
                 if rewrite_instruction is not None:
+                    logger.info("[GM run_turn] round=%d -> rigid menu rewrite, looping", round_idx)
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -196,8 +209,14 @@ class GameMasterAgent:
                 length_instruction = _build_narrative_length_instruction(
                     narration=narration,
                     opening_mode=False,
+                    user_input=user_input,
                 )
                 if length_instruction is not None:
+                    logger.info(
+                        "[GM run_turn] round=%d -> too short (%d/%d), looping",
+                        round_idx, _count_visible_characters(narration),
+                        _minimum_narrative_characters(opening_mode=False, user_input=user_input),
+                    )
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -207,6 +226,7 @@ class GameMasterAgent:
                     )
                     continue
 
+                logger.info("[GM run_turn] round=%d -> narration ACCEPTED", round_idx)
                 commit_session_record(working_record, record)
                 return AgentTurnResult(
                     narration=_scrub_narration(narration),
@@ -214,6 +234,7 @@ class GameMasterAgent:
                     mutation_logs=all_logs,
                 )
 
+            logger.info("[GM run_turn] round=%d -> empty narration, prompting again", round_idx)
             messages.append(assistant_message)
             messages.append(
                 {
@@ -225,9 +246,16 @@ class GameMasterAgent:
                 }
             )
 
+        logger.warning(
+            "[GM run_turn] tool loop exhausted after %d rounds, events=%d, using fallback",
+            self._max_tool_rounds, len(all_events),
+        )
         commit_session_record(working_record, record)
+        fallback_narration = await _generate_fallback_narration(
+            self._llm_client, messages, user_input, all_events,
+        )
         return AgentTurnResult(
-            narration=_build_turn_fallback(user_input, all_events),
+            narration=_scrub_narration(fallback_narration),
             executed_events=all_events,
             mutation_logs=all_logs,
         )
@@ -262,7 +290,7 @@ class GameMasterAgent:
             message="Resolving tools and validating world-state changes.",
         )
 
-        for _ in range(self._max_tool_rounds):
+        for round_idx in range(self._max_tool_rounds):
             response = await self._llm_client.complete_chat(
                 messages=messages,
                 tools=tools,
@@ -281,6 +309,10 @@ class GameMasterAgent:
                     )
                     all_events.extend(execution.executed_events)
                     all_logs.extend(execution.mutation_logs)
+                    logger.info(
+                        "[GM stream_turn] round=%d tool=%s events=%d",
+                        round_idx, tool_call["name"], len(execution.executed_events),
+                    )
                     messages.append(
                         {
                             "role": "tool",
@@ -296,11 +328,16 @@ class GameMasterAgent:
 
             narration = str(response.get("content") or "").strip()
             if narration:
+                logger.info(
+                    "[GM stream_turn] round=%d narration received, len=%d chars=%d",
+                    round_idx, len(narration), _count_visible_characters(narration),
+                )
                 follow_up_instruction = _build_missing_resolution_instruction(
                     user_input=user_input,
                     executed_events=all_events,
                 )
                 if follow_up_instruction is not None:
+                    logger.info("[GM stream_turn] round=%d -> missing resolution, looping", round_idx)
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -312,6 +349,7 @@ class GameMasterAgent:
 
                 rewrite_instruction = _build_narrative_rewrite_instruction(narration)
                 if rewrite_instruction is not None:
+                    logger.info("[GM stream_turn] round=%d -> rigid menu rewrite, looping", round_idx)
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -324,8 +362,14 @@ class GameMasterAgent:
                 length_instruction = _build_narrative_length_instruction(
                     narration=narration,
                     opening_mode=False,
+                    user_input=user_input,
                 )
                 if length_instruction is not None:
+                    logger.info(
+                        "[GM stream_turn] round=%d -> too short (%d/%d), looping",
+                        round_idx, _count_visible_characters(narration),
+                        _minimum_narrative_characters(opening_mode=False, user_input=user_input),
+                    )
                     messages.append(assistant_message)
                     messages.append(
                         {
@@ -335,6 +379,7 @@ class GameMasterAgent:
                     )
                     continue
 
+                logger.info("[GM stream_turn] round=%d -> narration ACCEPTED", round_idx)
                 yield AgentTurnStreamUpdate(
                     kind="status",
                     phase="writing_narration",
@@ -356,6 +401,7 @@ class GameMasterAgent:
                 )
                 return
 
+            logger.info("[GM stream_turn] round=%d -> empty narration, prompting again", round_idx)
             messages.append(assistant_message)
             messages.append(
                 {
@@ -367,20 +413,27 @@ class GameMasterAgent:
                 }
             )
 
-        fallback_narration = _build_turn_fallback(user_input, all_events)
+        logger.warning(
+            "[GM stream_turn] tool loop exhausted after %d rounds, events=%d, using fallback",
+            self._max_tool_rounds, len(all_events),
+        )
+        fallback_narration = await _generate_fallback_narration(
+            self._llm_client, messages, user_input, all_events,
+        )
+        scrubbed_fallback = _scrub_narration(fallback_narration)
         yield AgentTurnStreamUpdate(
             kind="status",
             phase="writing_narration",
-            message="Using fallback narration because the tool loop exhausted its rounds.",
+            message="Tool loop exhausted; generating narration via LLM fallback.",
         )
         yield AgentTurnStreamUpdate(kind="narration_start")
-        for chunk in _iter_narration_chunks(fallback_narration):
+        for chunk in _iter_narration_chunks(scrubbed_fallback):
             yield AgentTurnStreamUpdate(kind="narration_delta", delta=chunk)
-        yield AgentTurnStreamUpdate(kind="narration_end", narration=fallback_narration)
+        yield AgentTurnStreamUpdate(kind="narration_end", narration=scrubbed_fallback)
         yield AgentTurnStreamUpdate(
             kind="result",
             result=AgentTurnResult(
-                narration=fallback_narration,
+                narration=scrubbed_fallback,
                 executed_events=all_events,
                 mutation_logs=all_logs,
             ),
@@ -434,6 +487,13 @@ def _build_system_prompt(record: SessionRecord, *, opening_mode: bool) -> str:
         9. Use trigger_growth when a milestone, epiphany, or mastery break should visibly change the player.
         10. CRITICAL: You MUST call roll_d20_check for ANY risky, uncertain, or skill-dependent action the player attempts — including exploring unknown powers, attempting new techniques, sensing supernatural forces, or any action whose outcome is not guaranteed. Do NOT narrate the outcome of such actions without a tool roll first.
         11. CRITICAL: When a player describes discovering, awakening, or experimenting with new abilities, you MUST use trigger_growth to register the mechanical change. Do NOT narrate power awakenings or breakthroughs without committing the state change through trigger_growth first.
+
+        Time-skip and montage handling:
+        23. When the player requests a time skip or montage (e.g. "修炼到18岁", "训练三个月", "在此生活了十年"), this is NOT a risky action — do NOT call roll_d20_check for the passage of time itself.
+        24. For time skips: call trigger_growth once with growth_type="stat_boost" to reflect accumulated growth, then write the montage narration directly. Do NOT keep looping tools trying to resolve every individual event within the time skip.
+        25. Time-skip narration should be a vivid montage: compress years into sensory fragments, key moments, and turning points. 300-600 Chinese characters is ideal.
+        26. Only call additional tools (modify_game_state, update_quest_state) if the time skip clearly produces a concrete state change you need to register. One trigger_growth call is usually sufficient.
+        27. For trials, formations, traps, gauntlets, and sect entrance tests (e.g. "闯剑阵", "破阵", "过试炼"): treat them as risky environmental challenges. Start with roll_d20_check, then use modify_game_state or update_quest_state if the trial inflicts cost or clearly advances the scene.
 
         Director mindset:
         12. Combat is not a mandatory HP race. Dramatic actions may interrupt combat and trigger dialogue or standoff.
@@ -708,6 +768,70 @@ def _parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     return parsed
 
 
+async def _generate_fallback_narration(
+    llm_client: ToolCallingNarrativeClient,
+    messages: list[dict[str, Any]],
+    user_input: str,
+    events: list[ExecutedEvent],
+) -> str:
+    """Generate a proper narrative via LLM when the tool loop exhausts its rounds.
+
+    Instead of returning a hardcoded template, asks the LLM to write narration
+    based on the conversation so far. Falls back to the template only if the
+    LLM call itself fails.
+    """
+    # Build a summary of resolved events for context
+    event_summary_parts: list[str] = []
+    for event in events:
+        outcome = "成功" if event.is_success else "失败"
+        event_summary_parts.append(
+            f"- {event.abstract_action} ({event.event_type}): {outcome}"
+        )
+    event_summary = "\n".join(event_summary_parts) if event_summary_parts else "无"
+
+    fallback_prompt = dedent(
+        f"""
+        The tool resolution loop reached its maximum rounds. You must now write the final narration immediately.
+
+        Player action: {user_input}
+
+        Resolved tool events so far:
+        {event_summary}
+
+        Write a complete, immersive narration in Simplified Chinese that:
+        1. Covers the player's declared action with vivid, in-universe prose.
+        2. Incorporates all resolved tool outcomes naturally without exposing mechanics.
+        3. Is at least 300 visible Chinese characters.
+        4. Ends with a natural suspense hook — NOT a binary choice or menu.
+        5. Contains NO meta-commentary, NO mechanical terms like "判定成功/失败", NO dice results.
+
+        Write the narration now:
+        """
+    ).strip()
+
+    fallback_messages = messages + [
+        {
+            "role": "user",
+            "content": fallback_prompt,
+        }
+    ]
+
+    try:
+        response = await llm_client.complete_chat(
+            messages=fallback_messages,
+            tools=None,
+            temperature=0.6,
+        )
+        narration = str(response.get("content") or "").strip()
+        if narration and _count_visible_characters(narration) >= 120:
+            return narration
+    except LLMGatewayError:
+        pass
+
+    # Last resort: use the template fallback
+    return _build_turn_fallback(user_input, events)
+
+
 def _build_opening_fallback(record: SessionRecord) -> str:
     opening_scene = record.game_state.world_config.world_book.campaign_context.opening_scene.strip()
     question = "\u4f60\u73b0\u5728\u8981\u600e\u4e48\u505a\uff1f"
@@ -722,79 +846,105 @@ def _build_turn_fallback(user_input: str, events: list[ExecutedEvent]) -> str:
     Rather than mechanical fragments, weaves resolved facts into a short narrative
     paragraph that feels like a natural continuation of the story.
     """
+    action_text = user_input.strip() or "出手"
+
     if not events:
-        return "你屏住呼吸，重新审视了一遍局势，等待着下一个出手的时机。"
-
-    # Separate events by outcome
-    successes = [e for e in events if e.is_success]
-    failures = [e for e in events if not e.is_success]
-
-    # Gather outcome descriptors from tags
-    def _tag_summary(tags: list[str]) -> str:
-        if "target_killed" in tags:
-            return "一道致命打击落下。"
-        if "critical_hit" in tags:
-            return "暴击划破了防线。"
-        if "missed" in tags or "dodged_by_player" in tags:
-            return "攻击落了空。"
-        if "player_downed" in tags:
-            return "你感到身体猛地一沉，脚步踉跄。"
-        if "found_nothing" in tags:
-            return "翻遍了四周，一无所获。"
-        if any(t.startswith("found_") for t in tags):
-            return "手中多了些什么。"
-        if "state_change" in tags:
-            return "某种力量悄然改变了局势。"
-        if "inventory" in tags:
-            return "随身物品发生了变化。"
-        return ""
-
-    # Count unique event types
-    combat_count = sum(1 for e in events if e.event_type == "combat")
-    loot_count = sum(1 for e in events if e.event_type == "loot")
-    exploration_count = sum(1 for e in events if e.event_type == "exploration")
-
-    lines: list[str] = []
-
-    # Opening: a grounding observation about the player's declared action
-    action_snippet = user_input.strip()[:12]
-    openings = [
-        f"你{action_snippet}——",
-        f"就在你{action_snippet}的瞬间，",
-        f"一切发生在心跳之间。",
-        f"空气中弥漫着紧张的气息，你{action_snippet}——",
-    ]
-    lines.append(openings[hash(user_input) % len(openings)])
-
-    # Body: weave in resolved outcomes
-    if successes and failures:
-        lines.append(
-            "有些事情如你所愿，有些却偏离了轨道。"
+        if _looks_like_trial_or_hazard(action_text):
+            return (
+                f"你踏入{action_text}的瞬间，四周气机便同时绷紧，像无数看不见的锋刃贴着皮肤游走。"
+                "你只能强压住呼吸，在急促的心跳里重新分辨生门与死角。"
+                "阵势还没有真正停下，下一重变化已经在更深处悄悄抬头。"
+            )
+        return (
+            "你屏住呼吸，重新审视了一遍局势。"
+            "眼前的变化还没有彻底落定，空气里的压迫感依旧悬着，逼得你不得不重新判断下一步该把力道落向哪里。"
         )
-    elif successes:
-        lines.append("事情正在朝着有利的方向发展。")
-        if successes:
-            tag_desc = _tag_summary(sum((e.result_tags for e in successes), []))
-            if tag_desc:
-                lines.append(tag_desc)
-    elif failures:
-        lines.append("但事态并未如你所愿。")
-        failed_tags = sum((e.result_tags for e in failures), [])
-        tag_desc = _tag_summary(failed_tags)
-        if tag_desc:
-            lines.append(tag_desc)
 
-    # Closing: a suspense hook
-    hooks = [
-        "新的时机稍纵即逝。",
-        "下一个间隙随时可能出现。",
-        "你需要重新评估眼前的局面。",
-        "故事还在继续。",
-        "——你的下一步是什么？",
-    ]
-    lines.append(hooks[hash(user_input) % len(hooks)])
+    successes = [event for event in events if event.is_success]
+    failures = [event for event in events if not event.is_success]
+    success_tags = [tag for event in successes for tag in event.result_tags]
+    failure_tags = [tag for event in failures for tag in event.result_tags]
+    event_types = {event.event_type for event in events}
 
-    return "".join(lines)
+    lines = [_build_fallback_opening(action_text, event_types)]
+    if successes:
+        lines.append(_build_fallback_outcome(action_text, success_tags, event_types, positive=True))
+    if failures:
+        lines.append(_build_fallback_outcome(action_text, failure_tags, event_types, positive=False))
+    lines.append(_build_fallback_hook(action_text, event_types, success_tags, failure_tags))
+    return "".join(part for part in lines if part)
+
+
+def _build_fallback_opening(action_text: str, event_types: set[str]) -> str:
+    if _looks_like_trial_or_hazard(action_text):
+        options = [
+            f"你刚踏进{action_text}的范围，原本沉寂的气机便一下子活了过来，像有无数锋线从四面八方朝你压下。",
+            f"{action_text}的那一步才刚落稳，四周灵气便猛地收束，连呼吸都像被逼成了一条细线。",
+            f"你一头撞进{action_text}，耳边顿时尽是锐利的颤鸣，像整片空间都在试图把你的步伐切碎。",
+        ]
+        return options[_stable_text_index(action_text, len(options))]
+
+    if "combat" in event_types:
+        return f"你这一记{action_text}落下时，场中的气氛几乎在瞬间绷到了极点。"
+    if "exploration" in event_types:
+        return f"你顺着{action_text}的念头往前探去，眼前的局势立刻显出了新的棱角。"
+    return f"你刚一动手去做{action_text}，周围的气息就随之悄然偏转。"
+
+
+def _build_fallback_outcome(
+    action_text: str,
+    tags: list[str],
+    event_types: set[str],
+    *,
+    positive: bool,
+) -> str:
+    if positive:
+        if "target_killed" in tags:
+            return "最前方那股逼人的杀意被你硬生生撕开了一道口子，局势终于露出了可以喘息的缝隙。"
+        if "critical_hit" in tags:
+            return "其中一次碰撞几乎是贴着生死线劈开的，连周围积压的气机都被你震得微微一散。"
+        if _looks_like_trial_or_hazard(action_text):
+            return "你终究还是抓住了阵势转换时最关键的那一拍，让自己没有被第一波杀机直接吞进去。"
+        if "exploration" in event_types:
+            return "你在混乱里摸到了一点正确的方向，至少没有彻底失去前进的抓手。"
+        return "局面并没有完全失控，你至少逼出了一线对自己有利的空隙。"
+
+    if "player_downed" in tags:
+        return "可反震与压迫也顺着破绽一起撞了进来，逼得你胸口发闷，连脚步都险些当场散开。"
+    if "missed" in tags or "dodged_by_player" in tags or "power_gap_blocked" in tags:
+        return "可并不是每一步都落在你预想的位置，稍慢半拍的代价立刻被眼前的危险放大。"
+    if _looks_like_trial_or_hazard(action_text):
+        return "可阵势深处的变化比你预想得更阴狠，几道藏在暗处的锋意还是逼得你不得不临时改换身形。"
+    if "loot" in event_types:
+        return "但你想要的东西并没有就这样轻易落进手里，细节里的阻滞仍旧在拖慢你的节奏。"
+    return "但事态也没有完全照着你的心意发展，暗处的变化仍在不断挤压你能够腾挪的余地。"
+
+
+def _build_fallback_hook(
+    action_text: str,
+    event_types: set[str],
+    success_tags: list[str],
+    failure_tags: list[str],
+) -> str:
+    if _looks_like_trial_or_hazard(action_text):
+        hooks = [
+            "你还来不及把气息彻底理顺，阵纹更深处已经有新的剑鸣抬了起来。",
+            "可真正的考验显然还没结束，下一道变化已经顺着你脚下的落点逼近。",
+            "这还只是第一轮碰撞，藏在后面的杀机正顺着灵气回流一点点抬头。",
+        ]
+        return hooks[_stable_text_index(action_text + "".join(success_tags) + "".join(failure_tags), len(hooks))]
+
+    if "combat" in event_types:
+        return "对面的气息并没有因此彻底沉下去，下一次真正见血的碰撞随时可能压上来。"
+    if "exploration" in event_types:
+        return "前方的路并未完全敞开，新的线索和新的风险都还在更深处等着你伸手去碰。"
+    return "局势还在继续向前滚动，你已经没有太多迟疑的空档了。"
+
+
+def _stable_text_index(text: str, size: int) -> int:
+    if size <= 0:
+        return 0
+    return sum(ord(char) for char in text) % size
 
 
 def _build_missing_resolution_instruction(
@@ -854,12 +1004,82 @@ def _build_narrative_rewrite_instruction(narration: str) -> str | None:
     return None
 
 
+def _looks_like_time_skip(user_input: str) -> bool:
+    """Detect montage / time-skip actions that should have relaxed length requirements."""
+    if not user_input:
+        return False
+    normalized = user_input.strip()
+    time_skip_markers = (
+        "修炼到",
+        "修炼了",
+        "训练到",
+        "训练了",
+        "生活了",
+        "在此时",
+        "过了一个",
+        "度过",
+        "时光飞逝",
+        "几年后",
+        "数年后",
+        "个月后",
+        "十年",
+        "数年",
+        "长大到",
+        "成长到",
+        "一直到",
+        "直到",
+        "在此期间",
+        "日复一日",
+        "年复一年",
+        "岁月",
+    )
+    return any(marker in normalized for marker in time_skip_markers)
+
+
+def _looks_like_trial_or_hazard(user_input: str) -> bool:
+    """Detect formation / trap / sect-trial actions that behave like risky scenes."""
+    if not user_input:
+        return False
+    normalized = user_input.strip()
+    challenge_markers = (
+        "闯剑阵",
+        "剑阵",
+        "破阵",
+        "阵法",
+        "禁制",
+        "试炼",
+        "考核",
+        "闯关",
+        "过关",
+        "机关",
+        "幻阵",
+        "杀阵",
+        "试剑",
+        "剑关",
+    )
+    return any(marker in normalized for marker in challenge_markers)
+
+
+def _minimum_narrative_characters(*, opening_mode: bool, user_input: str = "") -> int:
+    if opening_mode:
+        return 380
+    if _looks_like_time_skip(user_input):
+        return 300
+    if _looks_like_trial_or_hazard(user_input):
+        return 380
+    return 500
+
+
 def _build_narrative_length_instruction(
     *,
     narration: str,
     opening_mode: bool,
+    user_input: str = "",
 ) -> str | None:
-    minimum_characters = 380 if opening_mode else 500
+    minimum_characters = _minimum_narrative_characters(
+        opening_mode=opening_mode,
+        user_input=user_input,
+    )
     visible_characters = _count_visible_characters(narration)
     if visible_characters >= minimum_characters:
         return None
@@ -1065,6 +1285,9 @@ def _infer_resolution_requirements(user_input: str) -> dict[str, int | bool]:
     if any(token in normalized for token in ability_exploration_markers):
         if min_skill_checks < 1:
             min_skill_checks = 1
+
+    if _looks_like_trial_or_hazard(normalized):
+        min_skill_checks = max(min_skill_checks, 1)
 
     needs_mp_change = any(
         token in normalized

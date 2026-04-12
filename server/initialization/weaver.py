@@ -222,15 +222,24 @@ class WorldWeaver:
                 break
 
             normalized = _normalize_generated_text(draft)
-            if _count_visible_characters(normalized) >= 800:
+            visible_characters = _count_visible_characters(normalized)
+            generic_opening = _looks_like_generic_prologue(normalized, world_config)
+            if visible_characters >= 800 and not generic_opening:
                 return normalized
-            if _count_visible_characters(normalized) > _count_visible_characters(best_attempt):
+            if not generic_opening and visible_characters > _count_visible_characters(best_attempt):
                 best_attempt = normalized
 
-            attempt_prompt = (
-                f"{prompt_bundle.user_prompt}\n\n"
-                "The previous draft was too short. Rewrite from scratch with at least 800 Chinese characters, "
-                "stronger sensory detail, and a sharper hook ending."
+            logger.info(
+                "WorldWeaver prologue draft rejected: chars=%s generic_opening=%s preview=%s",
+                visible_characters,
+                generic_opening,
+                _log_preview(normalized),
+            )
+            attempt_prompt = _build_prologue_retry_prompt(
+                prompt_bundle.user_prompt,
+                world_config=world_config,
+                visible_characters=visible_characters,
+                generic_opening=generic_opening,
             )
 
         if _count_visible_characters(best_attempt) >= 400:
@@ -319,7 +328,14 @@ def build_world_weaver_prompt(fanfic_prompt: str) -> WorldWeaverPromptBundle:
         - player_character should reflect the requested role card, tone, and personal drive.
         - player_character.objective should align with what the player wants to achieve.
         - player_character.attributes must include stat_power, stat_agility, stat_insight,
-          stat_tenacity, and stat_presence as integer scores, usually in the 6-18 range.
+          stat_tenacity, and stat_presence as integer scores.
+        - Attribute ranges must match the requested role's starting narrative weight.
+          Use roughly 6-18 for ordinary newcomers, 18-40 for veteran elites, and 40-80
+          for top-tier canon monsters, revived legends, final-boss peers, or other
+          setting-defining powerhouses.
+        - The player_character starting attributes must place them in a power tier that
+          matches their requested identity. Do not downgrade legendary or late-arc canon
+          characters into entry-tier ranks unless the prompt explicitly asks for a weakened start.
 
         Glossary minimums:
         - stats should include at least stat_hp and stat_mp when the setting has a spiritual, magical, psychic, or energy resource.
@@ -411,14 +427,19 @@ def build_prologue_prompt(
         写作硬性要求:
         1. 字数不少于 800 字，优先 900-1300 字。
         2. 必须按这个节奏推进：
-           - 感官唤醒（至少两种，如痛觉/气味/触感）
+           - 第一时间坠入开场场景中的正在发生之事
+           - 感官与环境同步展开（至少两种感官，但必须服务于场景，不要机械写痛觉）
            - 环境与时代交代（世界局势和地点气氛）
            - 主角能力初探（一次可见的能力尝试）
            - 突发危机或主线介入（必须形成强悬念）
         3. 绝对禁止“系统提示”“属性播报”“选项菜单”口吻。
         4. 多用短句和强动词，突出身体反应与心理波动。
         5. 结尾必须停在高张力自然断点，把行动权交给玩家。
-        6. 全文使用简体中文。
+        6. 不要机械套用“痛。”“冷。”“黑。”“睁开眼”“意识回笼”“后脑传来钝痛”“风里有铁锈味”等万能开场。
+           只有当设定明确要求角色正处于重伤、复活、苏醒或封印解除瞬间时，才允许写到这些状态，而且仍然要先落到具体场景。
+        7. 第一段必须明确落在给定的开场场景与初始地点，并至少点到一个世界锚点（地点、人物、组织、时代名词、关键物件）。
+        8. 严禁混入当前设定之外的 IP 人物、地点、组织或力量体系。
+        9. 全文使用简体中文。
         """
     ).strip()
 
@@ -444,6 +465,11 @@ def build_prologue_prompt(
         - 初始目标: {initial_quests}
         - 术语样本: {glossary_sample}
 
+        特别要求:
+        - 第一段第一句就必须把玩家直接放进“{campaign_context.opening_scene}”正在发生的瞬间。
+        - 即便设定涉及复活、重伤或苏醒，也不要用模板化的“痛”“睁开眼”“意识回笼”起手，优先呈现场景、地点、动作和冲突。
+        - 必须在前两段内明确点到至少一个世界锚点，如初始地点、玩家角色名、关键角色、组织、时代名词或关键物件。
+        - 不得引入未出现在上述世界锚点中的其他 IP 人物、地点或术语。
         现在直接写“序章正文”，不要输出标题、不要解释你的写作方法。
         """
     ).strip()
@@ -862,7 +888,7 @@ def _normalize_player_attribute_values(value: Any) -> dict[str, int]:
             normalized_key = str(key).strip()
             normalized_value = _coerce_int_value(raw_value)
             if normalized_key and normalized_value is not None:
-                attributes[normalized_key] = max(1, min(20, normalized_value))
+                attributes[normalized_key] = max(1, min(120, normalized_value))
 
     for key, default_value in DEFAULT_PLAYER_CHARACTER_ATTRIBUTES.items():
         attributes.setdefault(key, default_value)
@@ -900,6 +926,146 @@ def _count_visible_characters(text: str) -> int:
     return sum(1 for char in text if not char.isspace())
 
 
+def _build_prologue_retry_prompt(
+    base_user_prompt: str,
+    *,
+    world_config: WorldConfig,
+    visible_characters: int,
+    generic_opening: bool,
+) -> str:
+    campaign_context = world_config.world_book.campaign_context
+    player_name = world_config.player_character.name
+    rejection_reasons: list[str] = []
+    if visible_characters < 800:
+        rejection_reasons.append("篇幅不足 800 字")
+    if generic_opening:
+        rejection_reasons.append("开头落入了模板化序章，没有立刻贴住当前设定的开场场景")
+    if not rejection_reasons:
+        rejection_reasons.append("整体完成度不足")
+
+    return dedent(
+        f"""
+        {base_user_prompt}
+
+        上一个版本不合格，必须从头完整重写，不能沿用任何一句原文。
+        失败原因：{'；'.join(rejection_reasons)}。
+
+        这次重写必须满足：
+        - 第一段第一句就落在“{campaign_context.opening_scene}”内部正在发生的动作里。
+        - 第一段必须明确点到至少一个世界锚点：{world_config.starting_location}、{player_name}、{world_config.fanfic_meta.base_ip}、关键角色之一。
+        - 禁止使用“痛。”“冷。”“黑。”这类单句起手，也不要用“睁开眼”“意识回笼”“后脑传来钝痛”“风里有铁锈味”等模板化开头。
+        - 严禁混入不属于当前世界设定的人物、地点、组织、术语或力量体系。
+        - 继续使用简体中文，篇幅不少于 800 字，结尾依然要留下明确的玩家决策点。
+        """
+    ).strip()
+
+
+_PROLOGUE_STOCK_OPENING_PREFIXES = (
+    "痛。",
+    "疼。",
+    "冷。",
+    "黑。",
+    "雨是冷的。",
+    "风里有铁锈的味道。",
+    "剧痛",
+)
+
+_PROLOGUE_STOCK_OPENING_MARKERS = (
+    "睁开眼",
+    "意识回笼",
+    "后脑勺传来的钝痛",
+    "铁锈和腐朽木料的气味",
+    "像冰冷的沥青从骨髓深处漫上来",
+)
+
+_PROLOGUE_ANCHOR_STOPWORDS = {
+    "你",
+    "自己",
+    "当前",
+    "故事",
+    "世界",
+    "时代",
+    "场景",
+    "地点",
+    "目标",
+    "危机",
+    "角色",
+    "玩家",
+    "以及",
+    "正在",
+    "一名",
+    "那个",
+    "这里",
+}
+
+
+def _looks_like_generic_prologue(text: str, world_config: WorldConfig) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return True
+    if _looks_like_stock_prologue_opening(normalized):
+        return True
+    return not _contains_scene_anchor_near_opening(normalized, world_config)
+
+
+def _looks_like_stock_prologue_opening(text: str) -> bool:
+    first_paragraph = _first_nonempty_paragraph(text)[:180]
+    if not first_paragraph:
+        return False
+    if any(first_paragraph.startswith(prefix) for prefix in _PROLOGUE_STOCK_OPENING_PREFIXES):
+        return True
+    return any(marker in first_paragraph for marker in _PROLOGUE_STOCK_OPENING_MARKERS)
+
+
+def _contains_scene_anchor_near_opening(text: str, world_config: WorldConfig) -> bool:
+    opening_window = text[:260]
+    return any(anchor in opening_window for anchor in _extract_prologue_anchor_terms(world_config))
+
+
+def _extract_prologue_anchor_terms(world_config: WorldConfig) -> tuple[str, ...]:
+    campaign_context = world_config.world_book.campaign_context
+    raw_candidates = [
+        world_config.starting_location,
+        world_config.player_character.name,
+        world_config.player_character.role,
+        world_config.fanfic_meta.base_ip,
+        campaign_context.era_and_timeline,
+        campaign_context.opening_scene,
+        *world_config.key_npcs[:3],
+    ]
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in raw_candidates:
+        if not isinstance(candidate, str):
+            continue
+        stripped = candidate.strip()
+        if 2 <= len(stripped) <= 40 and stripped not in seen:
+            anchors.append(stripped)
+            seen.add(stripped)
+
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]{1,24}|[\u4e00-\u9fff]{2,12}", stripped):
+            normalized = token.strip("“”\"'，。！？；：、（）()《》【】[]")
+            if (
+                len(normalized) < 2
+                or normalized in seen
+                or normalized in _PROLOGUE_ANCHOR_STOPWORDS
+            ):
+                continue
+            anchors.append(normalized)
+            seen.add(normalized)
+
+    return tuple(anchors)
+
+
+def _first_nonempty_paragraph(text: str) -> str:
+    for paragraph in text.split("\n\n"):
+        stripped = paragraph.strip()
+        if stripped:
+            return stripped
+    return text.strip()
+
+
 def _build_prologue_fallback(world_config: WorldConfig) -> str:
     campaign_context = world_config.world_book.campaign_context
     location = world_config.starting_location
@@ -907,20 +1073,29 @@ def _build_prologue_fallback(world_config: WorldConfig) -> str:
     era = campaign_context.era_and_timeline
     macro_state = campaign_context.macro_world_state
     opening_scene = campaign_context.opening_scene
+    objective = world_config.player_character.objective
+    key_npcs = "、".join(world_config.key_npcs[:3]) if world_config.key_npcs else "眼前所有牵动局势的人"
+    initial_quests = "、".join(world_config.initial_quests[:3]) if world_config.initial_quests else "先稳住局面，再撕开第一道口子"
 
     return dedent(
         f"""
-        冷气像细针一样扎进你的喉咙。你本能地咽下一口带着铁锈味的空气，胸腔却被更重的压迫感堵住。掌心有汗，指节发白，耳边是自己过快的心跳。
+        {location}里的空气先一步绷紧了。{opening_scene}
 
-        {era}，世界表面仍在运转，可缝隙里全是危险。{macro_state}
+        这不是能够慢慢适应局面的地方。{era}的秩序表面还在运转，真正推动局势的，却是视线之外那只看不见的手。{macro_state}
 
-        你站在{location}，脚下每一步都像踩在将要断裂的薄冰上。{opening_scene}
+        你先确认身边能利用的东西，再确认自己还能调动多少力量。每一丝动静都像是在催你立刻做决定，因为再迟疑半步，今晚就会朝另一个方向失控。{objective}
 
-        你试着稳住呼吸，调动体内那股尚不稳定的力量。它并不听话，像一头被唤醒却不肯驯服的野兽，在血管里撞击。你知道自己不能再退。再退一步，可能就是万劫不复。
+        有些信息不需要别人提醒，你自己就能从空气里嗅出来。谁在盯着这里，谁在等待有人先出错，谁又把真正的筹码藏在尚未揭开的那一层表象后面。{key_npcs}这些名字或身影不会无缘无故出现在这场风暴边缘，他们和你一样，都已经被同一股暗流推到了局中。
 
-        就在你准备做出下一步动作时，危机先一步贴了上来。{looming_crisis}
+        你很清楚，开局最危险的从来不是看得见的敌人，而是那半拍的迟疑。你的视线必须更快，判断必须更准，出手必须带着目的。眼前每一个人、每一道声响、每一寸能借力的空间，都可能成为接下来翻盘或者崩盘的关键节点。{initial_quests}
 
-        风声忽然停了半秒，像有人按下了世界的静音键。下一瞬，一道陌生而危险的视线落在你身上，带着审判般的冷意。你意识到，从这一刻起，你说出的每一个字、做出的每一个动作，都将决定你是活着走出去，还是被这个时代吞没。
+        于是你逼着自己把节奏重新咬回手里。呼吸、站位、视线、先碰哪一个目标、先压住哪一处风险，所有选择都得在一两个心跳里完成。力量并不是摆在展示架上的东西，只有真正走到临界点，它才会回应你。你能感觉到那股力量已经沿着神经和骨骼缓慢抬头，像锋刃抵住鞘口，只差一个真正的触发点。
+
+        真正逼近你的东西比思考更快。{looming_crisis}
+
+        某个细节忽然放大，像一枚火星落进早已浇满油的现场。也许是视线角落的一次停顿，也许是脚步声里多出来的半拍，也许是一句本不该在此刻出现的话。总之，它来了，而且快得不打算给任何人做心理准备。
+
+        你知道，下一步不能再交给命运替你选择了。场面正在朝失控边缘滑去，而你已经站在那个必须伸手的人位子上。
         """
     ).strip()
 

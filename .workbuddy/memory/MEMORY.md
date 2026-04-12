@@ -31,3 +31,11 @@
 - 世界观生成时 LLM 自动生成 `power_tiers`，使用世界原生术语
 - 前端隐藏五维数值，只展示战斗力数值 + 修为等级 + 定性描述（极强/强/良/平/弱/极弱）
 - 每次 `_apply_logs` 后自动重算 power_level 和 rank_label
+
+## GM 叙事质量问题（已修复 2026-04-12）
+- **问题**：玩家输入时间跳跃/蒙太奇动作（如"修炼到18岁"）时，GM 回复变成硬编码模板短句
+- **根因**：DeepSeek 在 tool loop 中反复被长度检查打回，耗尽6轮上限，触发 `_build_turn_fallback` 硬编码模板
+- **修复**：
+  1. 系统提示词新增规则23-26：时间跳跃不是风险动作，不需 roll_d20_check；只需一次 trigger_growth + 直接写蒙太奇叙述
+  2. fallback 从硬编码模板改为 LLM 生成（`_generate_fallback_narration`），仅在 LLM 也失败时才用模板
+  3. 长度检查新增 `_looks_like_time_skip()`，时间跳跃场景最低字数从500降到300

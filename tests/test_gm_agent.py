@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 
-from server.agent.gm import GameMasterAgent
+from server.agent.gm import (
+    GameMasterAgent,
+    _build_turn_fallback,
+    _infer_resolution_requirements,
+)
 from server.agent.runtime_tools import execute_runtime_tool
 from server.generators.loot_generator import LootPool
 from server.runtime.session_store import SessionStore
-from server.schemas.core import FanficMetaData, WorldConfig, WorldGlossary, WorldNode
+from server.schemas.core import ExecutedEvent, FanficMetaData, WorldConfig, WorldGlossary, WorldNode
 
 
 class FakeToolCallingClient:
@@ -197,12 +201,49 @@ def test_session_creation_seeds_runtime_quest_and_encounter_logs() -> None:
         "stat_presence",
     }
     assert record.game_state.player.attributes["stat_insight"] == 14
+    assert record.game_state.player.power_level == 12
     assert record.game_state.player.growth.level == 1
     assert record.game_state.player.growth.proficiency_bonus == 2
     assert (
         record.game_state.world_config.world_book.campaign_context.current_chapter.linked_quest_id
         == "quest_01"
     )
+
+
+def test_infer_resolution_requirements_marks_trial_actions_as_risky() -> None:
+    requirements = _infer_resolution_requirements("闯剑阵")
+
+    assert requirements["min_skill_checks"] == 1
+    assert requirements["needs_mp_change"] is False
+    assert requirements["needs_growth_trigger"] is False
+
+
+def test_build_turn_fallback_for_trial_scene_keeps_action_context() -> None:
+    narration = _build_turn_fallback(
+        "闯剑阵",
+        [
+            ExecutedEvent(
+                event_type="skill_check",
+                is_success=True,
+                actor="player",
+                target="trial",
+                abstract_action="break_formation",
+                result_tags=["narrow_success"],
+            ),
+            ExecutedEvent(
+                event_type="skill_check",
+                is_success=False,
+                actor="player",
+                target="trial",
+                abstract_action="break_formation",
+                result_tags=["missed"],
+            ),
+        ],
+    )
+
+    assert "剑阵" in narration
+    assert "下一" in narration or "阵" in narration
+    assert len(narration) >= 60
 
 
 def test_gm_agent_resolves_compound_turn_with_multiple_tool_calls(monkeypatch) -> None:

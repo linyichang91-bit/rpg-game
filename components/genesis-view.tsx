@@ -1,12 +1,6 @@
 "use client";
 
-import {
-  FormEvent,
-  startTransition,
-  useDeferredValue,
-  useEffect,
-  useState
-} from "react";
+import { startTransition, useDeferredValue, useEffect, useState } from "react";
 
 import { generateWorld, startGame } from "@/lib/api";
 import { useSandboxStore } from "@/lib/store";
@@ -156,8 +150,7 @@ export function GenesisView() {
     lastTotalMs !== null ||
     stages.some((stage) => stage.status !== "pending");
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handleGenerateWorld() {
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt || isLoading) {
       return;
@@ -275,7 +268,12 @@ export function GenesisView() {
           创世 AI 会先理解世界与时间线，再提炼你真正想推进的目标，最后根据角色卡给出开局主线和玩家属性。
         </p>
 
-        <form className="genesis-form" onSubmit={handleSubmit}>
+        <form
+          className="genesis-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+          }}
+        >
           <div className="genesis-prompt-grid">
             <label className="genesis-prompt-block">
               <span className="genesis-prompt-kicker">01 · 世界与时间线</span>
@@ -349,7 +347,10 @@ export function GenesisView() {
             <button
               className="genesis-submit"
               disabled={!deferredPrompt.trim() || filledSectionCount === 0 || isLoading}
-              type="submit"
+              onClick={() => {
+                void handleGenerateWorld();
+              }}
+              type="button"
             >
               {isLoading ? "创世引擎正在编织中..." : "生成并进入世界"}
             </button>

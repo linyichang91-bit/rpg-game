@@ -167,3 +167,40 @@ def test_resolve_combat_skips_reaction_when_target_is_killed(monkeypatch) -> Non
     assert events[0].is_success is True
     assert "target_killed" in events[0].result_tags
     assert len(delete_logs) == 1
+
+
+def test_resolve_combat_respects_overwhelming_power_gap(monkeypatch) -> None:
+    state = build_state()
+    state.player.attributes = {
+        "stat_power": 60,
+        "stat_agility": 60,
+        "stat_insight": 40,
+        "stat_tenacity": 50,
+        "stat_presence": 40,
+    }
+    state.player.growth.level = 15
+    state.encounter_entities["enemy_01"].attributes = {
+        "stat_power": 10,
+        "stat_agility": 10,
+        "stat_tenacity": 10,
+    }
+    monkeypatch.setattr("server.pipelines.combat.random.randint", lambda _low, _high: 2)
+
+    logs, events = resolve_combat(
+        state,
+        {
+            "attacker_id": "player",
+            "target_id": "enemy_01",
+            "weapon_key": "item_pistol",
+            "action_type": "attack",
+        },
+    )
+
+    hp_logs = [log for log in logs if log.target_path == "encounter_entities.enemy_01.stats.stat_hp"]
+
+    assert len(events) == 1
+    assert events[0].is_success is True
+    assert "power_gap_overwhelming" in events[0].result_tags
+    assert "target_killed" in events[0].result_tags
+    assert len(hp_logs) == 1
+    assert hp_logs[0].value >= 16
